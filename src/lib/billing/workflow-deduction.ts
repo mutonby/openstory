@@ -9,6 +9,7 @@
  */
 
 import type { WorkflowScopedDb } from '@/lib/db/scoped-workflow';
+import type { ModelPricingProvider } from '@/lib/db/schema/model-pricing';
 import { reportMissingBillingCost } from './billing-observability';
 import { type Microdollars, microsToUsd, ZERO_MICROS } from './money';
 
@@ -104,6 +105,17 @@ export type FalUsage = {
    * record, the per-request billed cost the hourly reconcile audits against.
    */
   requestId?: string;
+  /**
+   * Which API billed this (#1157). Observations are keyed by
+   * (provider, endpointId), so a BytePlus sample filed under 'fal' would
+   * pollute the fal endpoint's median with a different denomination.
+   *
+   * Named `billingProvider`, not `provider`: callers spread whole generation
+   * metadata objects in here, and those already carry a `provider` meaning the
+   * LAB ("ElevenLabs", "ByteDance"). A bare `provider` would capture it
+   * silently and file every music sample under a nonexistent provider.
+   */
+  billingProvider?: ModelPricingProvider;
 };
 
 /**
@@ -117,6 +129,7 @@ function falUsageMetadata(metadata: FalUsage): FalUsage {
     unitsBilled: metadata.unitsBilled,
     numImages: metadata.numImages,
     requestId: metadata.requestId,
+    billingProvider: metadata.billingProvider,
   };
 }
 
@@ -151,7 +164,7 @@ export async function recordFalUsage(
     return;
   }
   await scopedDb.modelUsage.record({
-    provider: 'fal',
+    provider: usage.billingProvider ?? 'fal',
     endpointId: usage.endpointId,
     unitsBilled,
     numImages: usage.numImages,

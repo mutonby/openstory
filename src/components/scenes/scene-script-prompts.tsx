@@ -56,6 +56,8 @@ import {
   DEFAULT_VIDEO_MODEL,
   IMAGE_MODELS,
   IMAGE_TO_VIDEO_MODELS,
+  getBytePlusImageModelId,
+  getBytePlusVideoModelId,
   getCompatibleModel,
   safeImageToVideoModel,
   safeTextToImageModel,
@@ -72,6 +74,7 @@ import {
   DEFAULT_ASPECT_RATIO,
   type AspectRatio,
 } from '@/lib/constants/aspect-ratios';
+import { getMediaRoutesFn } from '@/functions/media-routes';
 import { getStorageDomainFn } from '@/functions/storage-config';
 import {
   Accordion,
@@ -80,6 +83,8 @@ import {
   AccordionTrigger,
 } from '@/components/ui/accordion';
 import { buildImageRequest } from '@/lib/image/build-image-request';
+import { buildBytePlusImageRequest } from '@/lib/image/build-byteplus-image-request';
+import { buildBytePlusVideoRequest } from '@/lib/motion/build-byteplus-video-request';
 import { buildMotionRequest } from '@/lib/motion/build-model-input';
 import {
   buildMotionReferenceImages,
@@ -1157,6 +1162,15 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
   });
   const storageDomain = storageConfig?.storageDomain ?? null;
 
+  // Which media route the platform is on (#1157) — decides whether the request
+  // preview below shows a fal body or an Ark one.
+  const { data: mediaRoutes } = useQuery({
+    queryKey: ['media-routes'],
+    queryFn: () => getMediaRoutesFn(),
+    staleTime: Infinity,
+  });
+  const byteplusEnabled = mediaRoutes?.byteplusEnabled ?? false;
+
   // Mirror of toCdnUrl for the client: absolutize only when the CDN domain
   // is configured, so prod previews show exactly what fal receives.
   const absolutizeUrl = useCallback(
@@ -1204,23 +1218,32 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
           modelKey
         );
         if (!modelPrompt) return [];
-        const request = buildMotionRequest(
-          {
-            prompt: modelPrompt,
-            imageUrl: absolutizeUrl(shot.image?.url ?? ''),
-            duration: resolveShotDuration({
-              explicit: undefined,
-              durationMs: shot.durationMs,
-              model: modelKey,
-            }),
-            aspectRatio,
-            generateAudio: videoModelSupportsAudio(modelKey)
-              ? generateAudio
-              : undefined,
-            referenceImages,
-          },
-          modelKey
-        );
+        const buildOptions = {
+          prompt: modelPrompt,
+          imageUrl: absolutizeUrl(shot.image?.url ?? ''),
+          duration: resolveShotDuration({
+            explicit: undefined,
+            durationMs: shot.durationMs,
+            model: modelKey,
+          }),
+          aspectRatio,
+          generateAudio: videoModelSupportsAudio(modelKey)
+            ? generateAudio
+            : undefined,
+          referenceImages,
+        };
+        // Preview the route the submit will actually take (#1157) — showing a
+        // fal body for a run that goes to Ark is worse than no preview, since
+        // the point of this panel is "what the model receives".
+        const byteplusRoute =
+          byteplusEnabled && getBytePlusVideoModelId(modelKey) !== undefined;
+        const request = byteplusRoute
+          ? (() => {
+              const ark = buildBytePlusVideoRequest(buildOptions, modelKey);
+              const { modelId, ...body } = ark;
+              return { endpointId: modelId, input: body };
+            })()
+          : buildMotionRequest(buildOptions, modelKey);
         return [
           {
             modelKey,
@@ -1248,6 +1271,7 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
     aspectRatio,
     generateAudio,
     absolutizeUrl,
+    byteplusEnabled,
   ]);
 
   // The exact fal request per image model — same reference resolution the
@@ -1276,7 +1300,7 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
             referenceImages,
             config.maxPromptLength
           );
-        const request = buildImageRequest({
+        const buildParams = {
           model: modelKey,
           prompt: enhancedPrompt,
           imageSize: aspectRatio
@@ -1284,7 +1308,17 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
             : undefined,
           numImages: 1,
           referenceImageUrls: referenceUrls,
-        });
+        };
+        // Preview the route the submit will actually take (#1157), as the
+        // motion preview above does.
+        const request =
+          byteplusEnabled && getBytePlusImageModelId(modelKey) !== undefined
+            ? (() => {
+                const { modelId, ...body } =
+                  buildBytePlusImageRequest(buildParams);
+                return { endpointId: modelId, input: body };
+              })()
+            : buildImageRequest(buildParams);
         return [
           {
             modelKey,
@@ -1309,6 +1343,7 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
     mentionLocations,
     aspectRatio,
     absolutizeUrl,
+    byteplusEnabled,
   ]);
 
   // Has the *currently-selected* video model produced a video for this scene —

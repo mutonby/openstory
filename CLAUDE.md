@@ -236,7 +236,22 @@ frame.metadata = {
 
 Access via `frameService.getSceneData(frame)`, `getVisualPrompt(frame)`, `getMotionPrompt(frame)`, or directly: `frame.metadata.metadata.title`, `frame.metadata.prompts.visual.fullPrompt`. Storing the full scene lets us regenerate without re-analyzing the script and preserves variants for retries.
 
-## Fal.ai Integration
+## Media providers: fal + BytePlus
+
+fal is the default route for every image / video / audio model. **Seedance (video) and Seedream (image) also have a native BytePlus Ark route (#1157)** — see below. Everything after this paragraph in the fal section applies to the fal route only.
+
+### BytePlus Ark (Seedance + Seedream)
+
+Two routes, one catalog key. `IMAGE_TO_VIDEO_MODELS.seedance_v2` / `IMAGE_MODELS.seedream_v5` carry a `byteplusId` alongside their fal endpoint id; `resolveMediaRoute` (`src/lib/ai/byteplus-config.ts`) picks per call — **BytePlus when `ARK_API_KEY` is set, fal otherwise, and always fal for a BYOK team** (their fal key, their bill). Sequences store the model _key_, never the endpoint, so the route can change without touching a row.
+
+- **Platform key only.** `team_api_keys` stays `'openrouter' | 'fal'` — there is no BYOK for BytePlus.
+- **Ark is not fal-shaped**, so the fal codegen (`bun motion:codegen`, `MOTION_TRANSFORMS`) does not apply. Requests are built by `build-byteplus-video-request.ts` / `build-byteplus-image-request.ts`. Three traps those files exist to encode: Ark **rejects frame roles mixed with reference roles** (a shot with cast refs sends the still AS a reference, not a `first_frame`); Seedream's `2K` token is **square**, so non-square sizes must be spelled in pixels; and image `watermark` **defaults to true**.
+- **Pricing is a static card**, not `model_pricing` — BytePlus publishes no pricing API. `src/lib/ai/byteplus-pricing.ts` holds dated, advertised (NOT bill-verified) rates and is merged into the effective pricing map at read time, so a fresh deploy never bills $0. When Ark is configured, `applyBytePlusRouteAliases` points the fal endpoint ids at the Ark rate, which is why **no estimator or UI call site needs to know the route**. Video bills in tokens (÷1000 for the `1000 tokens` unit); images bill per image.
+- **Ark quotas are per-ACCOUNT** (shared by every team), where fal's are per-key — so the backpressure is 429 classification + exponential backoff in `byteplus-rate-limit.ts`, which deliberately does **not** consume the content-flag retry budget (a quota rejection is not a content flag; re-rolling the seed wastes an attempt on a request the model never saw). Deliberately **not** a per-run fan-out cap: #1143 deleted that mechanism because it is per workflow RUN, so concurrent sequences multiply straight through it, and an account-wide quota is exactly the case it cannot see. Real admission control has to live where it can see the whole system. Because backoff is the _only_ backpressure, every rejection emits a `byteplus_quota_backoff` PostHog event (`byteplus-observability.ts`) — un-deduped, since a quota problem is a rate. Watch the `exhausted: true` rate: non-zero means users are seeing failed shots and it is time for a bounded queue in front of Ark (#891), not a per-run cap.
+- **Ark keys are region-scoped** and Seedance is served only from `ap-southeast`; an EU key fails at request time, not startup.
+- **E2E stays on fal.** aimock intercepts fal via the `x-fal-target-host` header, which Ark requests don't carry, so `isBytePlusConfigured()` returns false under `E2E_TEST` unless `ARK_BASE_URL` is also set. Recording Ark fixtures needs a real Ark key.
+
+### Fal.ai
 
 **Always check `/llms.txt` before updating models.** Machine-readable, authoritative param specs:
 

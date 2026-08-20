@@ -2,8 +2,8 @@
 name: update-model-versions
 description: >
   Check whether newer versions of the AI models we already use (fal.ai image,
-  video/motion, audio; OpenRouter text) or our @tanstack/ai* packages have
-  shipped, and open a PR bumping any genuine successor. Use when asked to
+  video/motion, audio; BytePlus Ark ids; OpenRouter text) or our @tanstack/ai*
+  packages have shipped, and open a PR bumping any genuine successor. Use when asked to
   "check for model updates", "are our models current", "bump models", or when
   run by the daily model-freshness routine. Only bumps EXISTING models to a
   newer version of the same model — it does not add net-new models.
@@ -19,7 +19,15 @@ Our model registries are the single source of truth:
 | Image (fal.ai)          | `src/lib/ai/models.ts`        | `IMAGE_MODELS`           |
 | Video / motion (fal.ai) | `src/lib/ai/models.ts`        | `IMAGE_TO_VIDEO_MODELS`  |
 | Audio (fal.ai)          | `src/lib/ai/models.ts`        | `AUDIO_MODELS`           |
+| BytePlus Ark ids        | `src/lib/ai/models.ts`        | `byteplusId` fields      |
 | AI SDK packages         | `package.json`                | `@tanstack/ai*`          |
+
+A model with a native BytePlus route (#1157) carries **two ids under one
+key**: the fal endpoint `id` AND a `byteplusId` (Ark model id). A version bump
+must move BOTH — bumping only the fal id silently routes Ark traffic to the
+older model (and vice versa), and the pricing alias
+(`applyBytePlusRouteAliases`) would quote the wrong rate for whichever id was
+left behind.
 
 The goal each run: detect newer versions → verify each is a real successor →
 open a focused PR that bumps it → leave everything green.
@@ -33,7 +41,11 @@ bun models:check --json   # { ok, errorCount, hasUpdates, models[], packages[] }
 
 `scripts/check-model-updates.ts` reads the registries and queries public,
 unauthenticated catalogs (fal.ai `/api/models`, OpenRouter `/api/v1/models`, npm
-registry). It is HTTP-only so it runs anywhere — no `FAL_KEY` or MCP needed.
+registry). BytePlus Ark ids are checked **offline** against the installed
+`@tanstack/ai-byteplus` model catalog — Ark publishes no unauthenticated
+catalog, so the adapter's lists are the freshness source and the npm check
+flags when the adapter itself (hence its catalog) is stale. Everything else is
+HTTP-only so it runs anywhere — no `FAL_KEY` or MCP needed.
 Behind a proxy it routes through `curl` (Bun's fetch can't traverse a
 TLS-intercepting proxy), so `curl` must be on PATH in that case.
 
@@ -71,6 +83,19 @@ the same model, one version newer — or a different product line / tier?_
 `https://openrouter.ai/api/v1/models` and keeps the same tier (don't turn a
 `-mini` into a non-mini, or a `pro` into `flash`).
 
+**BytePlus Ark ids:** verify against the live ModelArk docs
+(`docs.byteplus.com/en/docs/ModelArk/…`) plus the installed adapter's
+`model-meta` (its JSDoc records doc-vs-reality findings, e.g. per-model
+resolution tiers). Ark ids end in a `yymmdd` snapshot date; tier suffixes
+(`-fast`, `-mini`, `-lite`, `-pro`) are different products, not successors.
+Two Ark-specific gotchas: a new model answers **404 ModelNotOpen until
+activated in the Ark console** (verify at request time, not startup), and
+resolution tiers are per-model AND per-tier priced — the adapter's model-meta
+and BytePlus's own pricing page have disagreed about which tiers exist (e.g.
+Seedance 2.5's 1080p), so check the official rate table
+(`docs.byteplus.com/en/docs/ModelArk/1544106`) for the tier the request
+builders ask for, and confirm the rate-card entry matches THAT tier's price.
+
 **Reject a candidate when** it is a different tier/variant (fast/lite/standard
 vs pro, lora/trainer/edit gear), a different modality, a preview/experimental
 build replacing a stable one, or its schema/pricing changed so much it needs
@@ -105,6 +130,25 @@ Per class, edit and follow through:
   schemas. Re-check `maxPromptLength` against the new schema.
 - **Audio** (`models.ts` `AUDIO_MODELS`): update `id` + `capabilities`
   (durations, formats) from the new schema.
+- **BytePlus-routed models** (a `byteplusId` on the entry): bump the
+  `byteplusId` in the same PR as the fal id — never one without the other.
+  Then follow through:
+  - `src/lib/ai/byteplus-pricing.ts` — the rate card is keyed by Ark model id,
+    so the old id's entry must be replaced with the new id at the new model's
+    advertised rate (BytePlus publishes no pricing API; read the pricing page,
+    re-date the header comment, and note the rate is advertised-not-verified).
+    A missed rename means Ark generations bill $0 — exactly the #1069 failure
+    mode the card exists to prevent.
+  - `src/lib/ai/fal-cost.ts` `ENDPOINT_STRATEGY` — if the old fal endpoint ids
+    appear there (token-billed Seedance endpoints do), rename them too.
+  - The request builders (`build-byteplus-video-request.ts` /
+    `build-byteplus-image-request.ts`) read the id from the registry, but
+    re-check their baked-in assumptions (resolution tier, watermark default,
+    frame-vs-reference roles) against the new model's docs.
+  - e2e fixtures live under a fal-endpoint-keyed dir and each fixture's
+    `match.model` is the fal endpoint id, which aimock matches on — migrate
+    them (rename dir + edit `match.model`) rather than re-recording when the
+    prompt is unchanged.
 - **fal pricing:** model ids are pricing keys in `src/lib/ai/fal-pricing-data.ts`
   (auto-generated). After any fal id change run **`bun scripts/update-fal-pricing.ts`**
   (needs `FAL_KEY`). If it can't run, add the new id's pricing manually via the

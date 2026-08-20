@@ -4,7 +4,7 @@
       "match": {
         "endpoint": "fal",
         "userMessage": "Use @Image1 as the starting frame.\nSteady handheld pull-back. @Image2 charges toward camera through the breaking wave, arms still high. Whitewater slams her midriff and a laugh punches out of her. She keeps driving forward into the foam until the swell folds over her.\n\nSpray droplets scatter and fall in the sun. Foam rushes up the wet sand as the break collapses behind her.\n\nmorning surf, rolling swell, light onshore wind. wave crash, water slam against body, spray splash, laugh through spray.\n\nNo BGM, no music. Generate only dialogue, environmental sounds, and action sounds. Single continuous shot, no cuts. Avoid jitter and bent limbs.\n\nReference images:\n@Image3: CORAL_LIPSTICK - A slim pocket-length lipstick tube — keep visually consistent throughout the shot.",
-        "model": "bytedance/seedance-2.0/enterprise/v2/reference-to-video"
+        "model": "bytedance/seedance-2.5/reference-to-video"
       },
       "response": {
         "json": {

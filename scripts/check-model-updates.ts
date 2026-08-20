@@ -6,6 +6,8 @@
  *   - fal.ai catalog      → https://fal.ai/api/models?keywords=…&category=…
  *   - OpenRouter catalog  → https://openrouter.ai/api/v1/models
  *   - npm registry        → https://registry.npmjs.org/<pkg>
+ *   - BytePlus Ark        → the installed @tanstack/ai-byteplus model catalog
+ *     (offline — Ark has no public catalog; the npm check flags a stale adapter)
  *
  * This is the deterministic backbone of the `update-model-versions` skill and
  * the daily "model freshness" routine. It only REPORTS candidates — deciding
@@ -39,6 +41,11 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import {
+  BYTEPLUS_IMAGE_MODELS,
+  BYTEPLUS_VIDEO_MODELS,
+} from '@tanstack/ai-byteplus';
+
+import {
   AUDIO_MODELS,
   IMAGE_MODELS,
   IMAGE_TO_VIDEO_MODELS,
@@ -58,7 +65,7 @@ type Candidate = {
 };
 
 type ModelReport = {
-  source: 'fal-image' | 'fal-video' | 'fal-audio' | 'openrouter';
+  source: 'fal-image' | 'fal-video' | 'fal-audio' | 'openrouter' | 'byteplus';
   key: string;
   currentId: string;
   currentVersion: string | null;
@@ -401,6 +408,73 @@ async function checkTextModels(): Promise<ModelReport[]> {
 }
 
 // ---------------------------------------------------------------------------
+// BytePlus (Ark) model checks
+// ---------------------------------------------------------------------------
+// Ark has no public unauthenticated catalog, so the freshness source is the
+// installed @tanstack/ai-byteplus adapter's model lists — offline by design.
+// The npm check above flags when the adapter itself (and hence its catalog)
+// is stale, so together the two checks cover "Ark shipped a newer model".
+
+/**
+ * Split an Ark model id into brand / version / tier.
+ * Ids follow `[<org>-]<brand>-<major>-<minor>[-<tier>…]-<yymmdd>`, e.g.
+ * `dreamina-seedance-2-5-260628` → seedance 2.5 (no tier),
+ * `seedance-1-0-pro-fast-251015` → seedance 1.0 `pro-fast`.
+ */
+function arkParts(id: string): {
+  brand: string;
+  version: string | null;
+  tier: string;
+} {
+  const match = id.match(/^(.*?)-(\d+)-(\d+)((?:-[a-z]+)*)-\d{6}$/);
+  if (!match) return { brand: id, version: null, tier: '' };
+  const brandTokens = (match[1] ?? '').split('-');
+  return {
+    brand: brandTokens[brandTokens.length - 1] ?? '',
+    version: `${match[2]}.${match[3]}`,
+    tier: (match[4] ?? '').replace(/^-/, ''),
+  };
+}
+
+function checkBytePlusModels(): ModelReport[] {
+  const registry = [
+    ...Object.entries(IMAGE_MODELS),
+    ...Object.entries(IMAGE_TO_VIDEO_MODELS),
+  ].flatMap(([key, m]) =>
+    'byteplusId' in m ? [{ key, byteplusId: m.byteplusId }] : []
+  );
+  const adopted = new Set<string>(registry.map((r) => r.byteplusId));
+  const catalog: readonly string[] = [
+    ...BYTEPLUS_VIDEO_MODELS,
+    ...BYTEPLUS_IMAGE_MODELS,
+  ];
+
+  return registry.map(({ key, byteplusId }) => {
+    const current = arkParts(byteplusId);
+    const family = catalog
+      .filter((id) => id !== byteplusId && arkParts(id).brand === current.brand)
+      .map((id) => ({ id, version: arkParts(id).version }))
+      .sort((a, b) => compareVersions(b.version, a.version));
+    // Apples-to-apples: same tier only (a `-fast`/`-mini`/`-pro` sibling is a
+    // different product, not a successor).
+    const newer = family.filter(
+      (c) =>
+        compareVersions(c.version, current.version) > 0 &&
+        !adopted.has(c.id) &&
+        arkParts(c.id).tier === current.tier
+    );
+    return {
+      source: 'byteplus' as const,
+      key,
+      currentId: byteplusId,
+      currentVersion: current.version,
+      newer,
+      family,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // npm package checks (@tanstack/ai*)
 // ---------------------------------------------------------------------------
 
@@ -473,7 +547,11 @@ async function main() {
     checkPackages(),
   ]);
 
-  const modelReports = [...falReports, ...textReports];
+  const modelReports = [
+    ...falReports,
+    ...textReports,
+    ...checkBytePlusModels(),
+  ];
   const modelsWithUpdates = modelReports.filter((r) => r.newer.length > 0);
   const packagesWithUpdates = packageReports.filter((r) => r.isOutdated);
   const hasUpdates =
@@ -520,6 +598,7 @@ function printReport(
     'fal-video': 'Video / motion (fal.ai)',
     'fal-audio': 'Audio (fal.ai)',
     openrouter: 'Text (OpenRouter)',
+    byteplus: 'BytePlus Ark (adapter catalog)',
   };
 
   console.log('\n=== Model freshness report ===\n');
@@ -529,6 +608,7 @@ function printReport(
     'fal-video',
     'fal-audio',
     'openrouter',
+    'byteplus',
   ] as const) {
     const group = modelReports.filter((r) => r.source === source);
     console.log(`## ${SOURCE_LABEL[source]}`);

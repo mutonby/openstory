@@ -1232,12 +1232,12 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
             : undefined,
           referenceImages,
         };
-        // Preview the route the submit will actually take (#1157) — showing a
+        // Preview the via the submit will actually take (#1157) — showing a
         // fal body for a run that goes to Ark is worse than no preview, since
         // the point of this panel is "what the model receives".
-        const byteplusRoute =
+        const byteplusVia =
           byteplusEnabled && getBytePlusVideoModelId(modelKey) !== undefined;
-        const request = byteplusRoute
+        const request = byteplusVia
           ? (() => {
               const ark = buildBytePlusVideoRequest(buildOptions, modelKey);
               const { modelId, ...body } = ark;
@@ -1309,7 +1309,7 @@ export const SceneScriptPrompts: React.FC<SceneScriptPromptsProps> = ({
           numImages: 1,
           referenceImageUrls: referenceUrls,
         };
-        // Preview the route the submit will actually take (#1157), as the
+        // Preview the via the submit will actually take (#1157), as the
         // motion preview above does.
         const request =
           byteplusEnabled && getBytePlusImageModelId(modelKey) !== undefined

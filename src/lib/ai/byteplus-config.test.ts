@@ -4,10 +4,10 @@ const env: Record<string, string | undefined> = {};
 
 vi.doMock('#env', () => ({ getEnv: () => env }));
 
-const { resolveMediaRoute, isBytePlusConfigured, arkAdapterConfig } =
+const { resolveMediaVia, isBytePlusConfigured, arkAdapterConfig } =
   await import('./byteplus-config');
 
-describe('resolveMediaRoute', () => {
+describe('resolveMediaVia', () => {
   beforeEach(() => {
     env.ARK_API_KEY = undefined;
     env.ARK_BASE_URL = undefined;
@@ -15,7 +15,7 @@ describe('resolveMediaRoute', () => {
 
   it('routes to fal when no Ark key is configured', () => {
     expect(
-      resolveMediaRoute({
+      resolveMediaVia({
         byteplusModelId: 'dreamina-seedance-2-5-260628',
         usingOwnFalKey: false,
       })
@@ -25,7 +25,7 @@ describe('resolveMediaRoute', () => {
   it('routes to byteplus when an Ark key is configured', () => {
     env.ARK_API_KEY = 'ark-test';
     expect(
-      resolveMediaRoute({
+      resolveMediaVia({
         byteplusModelId: 'dreamina-seedance-2-5-260628',
         usingOwnFalKey: false,
       })
@@ -35,7 +35,7 @@ describe('resolveMediaRoute', () => {
   it('routes to fal for a model with no BytePlus id, key or not', () => {
     env.ARK_API_KEY = 'ark-test';
     expect(
-      resolveMediaRoute({ byteplusModelId: undefined, usingOwnFalKey: false })
+      resolveMediaVia({ byteplusModelId: undefined, usingOwnFalKey: false })
     ).toBe('fal');
   });
 
@@ -45,7 +45,7 @@ describe('resolveMediaRoute', () => {
   it('keeps a BYOK team on fal even when Ark is configured', () => {
     env.ARK_API_KEY = 'ark-test';
     expect(
-      resolveMediaRoute({
+      resolveMediaVia({
         byteplusModelId: 'dreamina-seedance-2-5-260628',
         usingOwnFalKey: true,
       })

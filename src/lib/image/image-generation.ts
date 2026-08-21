@@ -1,19 +1,28 @@
 import { getEnv } from '#env';
+import {
+  arkAdapterConfig,
+  getArkApiKey,
+  resolveMediaVia,
+} from '@/lib/ai/byteplus-config';
+import { withBytePlusQuotaRetry } from '@/lib/ai/byteplus-rate-limit';
 import { isContentRejectionError } from '@/lib/ai/content-rejection';
 import { falCostFromUnits } from '@/lib/ai/fal-cost';
 import { FAL_GENERATION_TIMEOUT_MS } from '@/lib/ai/fal-deadline-fetch';
 import { extractFalErrorMessage } from '@/lib/ai/fal-error';
+import { getBytePlusImageModelId } from '@/lib/ai/models';
+import type { MediaVia } from '@/lib/ai/via';
 import { type Microdollars } from '@/lib/billing/money';
 import type { CredentialScopedDb } from '@/lib/db/scoped-workflow';
+import { buildBytePlusImageRequest } from '@/lib/image/build-byteplus-image-request';
 import type { ImageGenerationParams } from '@/lib/image/build-image-request';
 import { buildImageRequest } from '@/lib/image/build-image-request';
-import type { MediaVia } from '@/lib/ai/via';
 import {
   recordMediaGenerationSpan,
   type AIObservabilityMeta,
 } from '@/lib/observability/ai-otel';
 import { ensureExternallyFetchableUrls } from '@/lib/storage/external-url';
 import { generateImage } from '@tanstack/ai';
+import { createBytePlusImage } from '@tanstack/ai-byteplus';
 import { falImage } from '@tanstack/ai-fal';
 
 export type { ImageGenerationParams } from '@/lib/image/build-image-request';
@@ -74,12 +83,17 @@ export async function generateImageWithProvider(
     userId: options?.observability?.userId ?? options?.scopedDb?.userId,
   };
 
-  // Resolve via out here so the failure span names the API that rejected.
-  let via: MediaVia = 'fal';
+  // Claim via out here so the failure span names the API that rejected.
+  const key = options?.scopedDb
+    ? await options.scopedDb.resolveKey('fal')
+    : { key: getEnv().FAL_KEY, source: 'platform' as const };
+  const via = resolveMediaVia({
+    byteplusModelId: getBytePlusImageModelId(params.model),
+    usingOwnFalKey: key.source === 'team',
+  });
 
   try {
-    const result = await generateImageInternal(params, options);
-    via = result.via;
+    const result = await generateImageInternal(params, key, via);
     recordMediaGenerationSpan({
       ...attribution,
       model: params.model,
@@ -120,16 +134,12 @@ export async function generateImageWithProvider(
 
 async function generateImageInternal(
   rawParams: ImageGenerationParams,
-  options?: ImageGenerationOptions
+  key: { key: string; source: 'platform' | 'team' },
+  via: MediaVia
 ): Promise<ImageGenerationResult> {
-  // Native PRs try their key first (resolveOptionalKey) and switch via.
-  // Fal is the fallback and always claims.
-  const key = options?.scopedDb
-    ? await options.scopedDb.resolveKey('fal')
-    : { key: getEnv().FAL_KEY, source: 'platform' as const };
-
-  // Locally-served /r2/ reference URLs aren't reachable by real fal — swap
-  // them for fal-storage uploads first (no-op in prod and e2e replay).
+  // Locally-served /r2/ reference URLs aren't reachable by real fal or Ark —
+  // swap them for fal-storage uploads first (no-op in prod and e2e replay).
+  // Ark needs every ref URL fetchable; fal storage is a public CDN.
   const params: ImageGenerationParams = rawParams.referenceImageUrls?.length
     ? {
         ...rawParams,
@@ -141,17 +151,16 @@ async function generateImageInternal(
     : rawParams;
   const startTime = Date.now();
 
-  // The exact request fal receives — shared with the scene editor's
-  // optimised-prompt preview so the two can never drift. `via` is stamped
-  // on the endpoint (pricing Via); vendor is `IMAGE_MODELS[model].vendor`.
-  const { via, endpointId: endpoint, input } = buildImageRequest(params);
-  const { prompt, ...modelOptions } = input;
-
   let result;
+  let endpoint: string;
   // Native PRs widen MediaVia; this switch is the seam (#1216).
   switch (via) {
-    // oxlint-disable-next-line typescript/no-unnecessary-condition
-    case 'fal':
+    case 'fal': {
+      // The exact request fal receives — shared with the scene editor's
+      // optimised-prompt preview so the two can never drift.
+      const built = buildImageRequest(params);
+      endpoint = built.endpointId;
+      const { prompt, ...modelOptions } = built.input;
       // Bound so a hung fal.subscribe fails the workflow step and CF can retry
       // (#826). Native activity `timeout` since @tanstack/ai@0.44 / ai-fal@0.10.
       result = await generateImage({
@@ -162,6 +171,32 @@ async function generateImageInternal(
         debug: false,
       });
       break;
+    }
+    case 'byteplus': {
+      const arkKey = getArkApiKey();
+      if (!arkKey) {
+        throw new Error('ARK_API_KEY is required for the BytePlus image via');
+      }
+      const request = buildBytePlusImageRequest(params);
+      endpoint = request.modelId;
+      const { apiKey, ...config } = arkAdapterConfig(
+        arkKey,
+        FAL_GENERATION_TIMEOUT_MS
+      );
+      result = await withBytePlusQuotaRetry('image generate', () =>
+        generateImage({
+          adapter: createBytePlusImage(request.modelId, apiKey, config),
+          prompt: request.prompt,
+          size: request.size,
+          ...(request.numberOfImages !== undefined && {
+            numberOfImages: request.numberOfImages,
+          }),
+          modelOptions: request.modelOptions,
+          debug: false,
+        })
+      );
+      break;
+    }
   }
 
   const imageUrls = result.images
@@ -174,8 +209,8 @@ async function generateImageInternal(
 
   const processingTimeMs = Date.now() - startTime;
 
-  // Exact cost from fal's reported billed units (resolution/style premiums are
-  // already baked into the count by fal).
+  // Exact cost from the via's reported billed units. Fal bakes resolution
+  // premiums into the count; Ark bills Seedream per generated image.
   const cost = await falCostFromUnits(endpoint, result.usage?.unitsBilled);
 
   return {
@@ -201,7 +236,7 @@ async function generateImageInternal(
       // The adapter sets `id` to fal's request id — the join key to the
       // billing-events record the hourly reconcile audits this charge against.
       requestId: result.id,
-      usedOwnKey: key.source === 'team',
+      usedOwnKey: via === 'byteplus' ? false : key.source === 'team',
     },
   };
 }

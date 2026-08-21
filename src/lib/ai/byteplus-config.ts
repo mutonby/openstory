@@ -6,7 +6,7 @@
  * fal. Ark is the first-party API: BytePlus billing and quota, the full
  * Seedance request surface (reference-media roles, `return_last_frame`,
  * `camera_fixed`), and BytePlus's own model ids. Both routes stay wired — the
- * catalog key is stable and `resolveMediaRoute` picks the route per call, so a
+ * catalog key is stable and `resolveMediaVia` picks the via per call, so a
  * deployment with no `ARK_API_KEY` keeps working exactly as before.
  *
  * Platform key only: `team_api_keys` stays `'openrouter' | 'fal'`. A team that
@@ -15,9 +15,7 @@
  */
 
 import { getEnv } from '#env';
-
-/** Which API a media generation is submitted to. */
-export type MediaRoute = 'fal' | 'byteplus';
+import type { MediaVia } from '@/lib/ai/via';
 
 /**
  * Ark data-plane base URL. The adapter defaults to the Asia-Pacific host;
@@ -42,7 +40,7 @@ export function getArkApiKey(): string | undefined {
  * header. Playwright injects the developer's process env into the worker
  * (`CLOUDFLARE_INCLUDE_PROCESS_ENV`), so an `ARK_API_KEY` sitting in a local
  * `.env.local` would silently point the suite at real, billable BytePlus. Under
- * `E2E_TEST` the route therefore stays off unless `ARK_BASE_URL` is also set —
+ * `E2E_TEST` the via therefore stays off unless `ARK_BASE_URL` is also set —
  * i.e. unless someone has deliberately wired a mock host to record against.
  */
 export function isBytePlusConfigured(): boolean {
@@ -53,16 +51,18 @@ export function isBytePlusConfigured(): boolean {
 }
 
 /**
- * Pick the route for one generation.
+ * Claim the via for one generation. Stamp this on the job; poll MUST follow
+ * the stamp rather than re-running this (an `ARK_API_KEY` added or removed
+ * mid-run would send an Ark task id to fal).
  *
  * BytePlus wins when the platform has an Ark key AND the model has a BytePlus
  * id — otherwise fal. `usingOwnFalKey` flips it back to fal for a BYOK team
  * (see the module header): their key, their bill.
  */
-export function resolveMediaRoute(options: {
+export function resolveMediaVia(options: {
   byteplusModelId: string | undefined;
   usingOwnFalKey: boolean;
-}): MediaRoute {
+}): MediaVia {
   if (options.usingOwnFalKey) return 'fal';
   if (!options.byteplusModelId) return 'fal';
   return isBytePlusConfigured() ? 'byteplus' : 'fal';

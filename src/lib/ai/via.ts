@@ -8,11 +8,12 @@
  * at submit: job ids are via-scoped, and re-resolving from live keys can send
  * a fal id to xAI (or the reverse).
  */
-export type MediaVia = 'fal';
+export type MediaVia = 'fal' | 'byteplus';
 
 export function assertMediaVia(via: string): MediaVia {
   switch (via) {
     case 'fal':
+    case 'byteplus':
       return via;
     default:
       throw new Error(`Unknown media via: ${via}`);

@@ -1,5 +1,12 @@
 import { getEnv } from '#env';
 import {
+  arkAdapterConfig,
+  getArkApiKey,
+  resolveMediaVia,
+} from '@/lib/ai/byteplus-config';
+import { bytePlusVideoUnitsBilled } from '@/lib/ai/byteplus-pricing';
+import { withBytePlusQuotaRetry } from '@/lib/ai/byteplus-rate-limit';
+import {
   estimateFalCost,
   falCostFromUnits,
   type EffectiveFalPricing,
@@ -10,14 +17,15 @@ import {
 } from '@/lib/ai/fal-deadline-fetch';
 import {
   DEFAULT_VIDEO_MODEL,
+  getBytePlusVideoModelId,
   IMAGE_TO_VIDEO_MODELS,
   type ImageToVideoModel,
 } from '@/lib/ai/models';
+import { assertMediaVia, type MediaVia } from '@/lib/ai/via';
 import type { Microdollars } from '@/lib/billing/money';
 import { type AspectRatio } from '@/lib/constants/aspect-ratios';
 import type { ResolvedApiKey } from '@/lib/db/scoped/api-keys';
 import type { CredentialScopedDb } from '@/lib/db/scoped-workflow';
-import { assertMediaVia, type MediaVia } from '@/lib/ai/via';
 import { MOTION_JSON_SCHEMAS } from '@/lib/motion/endpoint-map';
 import {
   getDurationValues,
@@ -31,7 +39,9 @@ import {
   getVideoJobStatus,
   type TokenUsage,
 } from '@tanstack/ai';
+import { createBytePlusVideo } from '@tanstack/ai-byteplus';
 import { falVideo } from '@tanstack/ai-fal';
+import { buildBytePlusVideoRequest } from './build-byteplus-video-request';
 import { buildModelInput, buildMotionRequest } from './build-model-input';
 import { resolveMotionEndpoint } from './resolve-motion-endpoint';
 
@@ -103,63 +113,60 @@ export async function submitMotionJob(
 ): Promise<MotionJobSubmission> {
   const modelKey = options.model || DEFAULT_VIDEO_MODEL;
 
-  // Native PRs try their key first (resolveOptionalKey) and set via. Fal is
-  // the fallback and always claims.
+  // Fal key is always resolved: BYOK fal stays on fal (billing invariant),
+  // and fal-storage URL rewrite authenticates with this key for both vias.
+  // BytePlus is platform-only — no resolveOptionalKey('byteplus').
   const key = await resolveFalMotionKey(options.scopedDb);
+  const via = resolveMediaVia({
+    byteplusModelId: getBytePlusVideoModelId(modelKey),
+    usingOwnFalKey: key.source === 'team',
+  });
 
-  // Locally-served /r2/ image URLs aren't reachable by real fal — swap them
-  // for a fal-storage upload first (no-op in prod and e2e replay).
+  // Locally-served /r2/ image URLs aren't reachable by real fal or Ark —
+  // swap them for a fal-storage upload first (no-op in prod and e2e replay).
   const imageUrl = await ensureExternallyFetchableUrl(
     options.imageUrl,
     key.key
   );
 
-  // Decide which endpoint this run submits to (#873). With cast/element refs,
-  // models that have a dedicated reference-to-video endpoint (Seedance) route
-  // there; everything else (incl. Kling, which carries refs inline as
-  // `elements`) stays on its image-to-video endpoint. `via` is stamped on the
-  // endpoint (pricing Via).
-  const hasReferenceImages = (options.referenceImages?.length ?? 0) > 0;
-  const endpoint = resolveMotionEndpoint(modelKey, hasReferenceImages);
-
-  // Reference URLs only need to be fetchable when they go on the wire
-  // (`endpoint` or `inline`). Models with `references: 'none'` keep the raw
-  // URLs: they are never sent, but the builder still needs tokens +
-  // descriptions to substitute entity names in the prompt.
-  const referenceImages =
-    endpoint.references !== 'none' && options.referenceImages?.length
-      ? await Promise.all(
-          options.referenceImages.map(async (ref) => ({
-            ...ref,
-            referenceImageUrl: await ensureExternallyFetchableUrl(
-              ref.referenceImageUrl,
-              key.key
-            ),
-          }))
-        )
-      : options.referenceImages;
-
-  const optionsWithFetchableUrls = {
-    ...options,
-    imageUrl,
-    referenceImages,
-    model: modelKey,
-  };
-  const modelInput = buildMotionRequest(
-    optionsWithFetchableUrls,
-    modelKey
-  ).input;
-
-  const { prompt: optimisedPrompt, ...modelOptions } = modelInput;
-  if (typeof optimisedPrompt !== 'string') {
-    throw new Error('Truncated prompt is not a string');
-  }
-
   let jobId: string;
   // Native PRs widen MediaVia; this switch is the seam (#1216).
-  switch (endpoint.via) {
-    // oxlint-disable-next-line typescript/no-unnecessary-condition
+  switch (via) {
     case 'fal': {
+      // Decide which fal endpoint this run submits to (#873). With
+      // cast/element refs, models that have a dedicated reference-to-video
+      // endpoint (Seedance) go there; everything else (incl. Kling, which
+      // carries refs inline as `elements`) stays on image-to-video.
+      const hasReferenceImages = (options.referenceImages?.length ?? 0) > 0;
+      const endpoint = resolveMotionEndpoint(modelKey, hasReferenceImages);
+
+      // Reference URLs only need to be fetchable when they go on the wire
+      // (`endpoint` or `inline`). Models with `references: 'none'` keep the
+      // raw URLs: they are never sent, but the builder still needs tokens +
+      // descriptions to substitute entity names in the prompt.
+      const referenceImages =
+        endpoint.references !== 'none' && options.referenceImages?.length
+          ? await Promise.all(
+              options.referenceImages.map(async (ref) => ({
+                ...ref,
+                referenceImageUrl: await ensureExternallyFetchableUrl(
+                  ref.referenceImageUrl,
+                  key.key
+                ),
+              }))
+            )
+          : options.referenceImages;
+
+      const modelInput = buildMotionRequest(
+        { ...options, imageUrl, referenceImages, model: modelKey },
+        modelKey
+      ).input;
+
+      const { prompt: optimisedPrompt, ...modelOptions } = modelInput;
+      if (typeof optimisedPrompt !== 'string') {
+        throw new Error('Truncated prompt is not a string');
+      }
+
       // Bound submit so a hung fal connection fails the step (#826).
       const job = await generateVideo({
         adapter: falVideo(endpoint.endpointId, { apiKey: key.key }),
@@ -171,13 +178,54 @@ export async function submitMotionJob(
       jobId = job.jobId;
       break;
     }
+    case 'byteplus': {
+      const arkKey = getArkApiKey();
+      if (!arkKey) {
+        throw new Error('ARK_API_KEY is required for the BytePlus motion via');
+      }
+      // Ark carries references as roled prompt parts, so every reference URL
+      // must be externally fetchable — unlike fal, there is no path where
+      // the URLs go unsent.
+      const referenceImages = options.referenceImages?.length
+        ? await Promise.all(
+            options.referenceImages.map(async (ref) => ({
+              ...ref,
+              referenceImageUrl: await ensureExternallyFetchableUrl(
+                ref.referenceImageUrl,
+                key.key
+              ),
+            }))
+          )
+        : options.referenceImages;
+      const request = buildBytePlusVideoRequest(
+        { ...options, imageUrl, referenceImages },
+        modelKey
+      );
+      const { apiKey, ...config } = arkAdapterConfig(
+        arkKey,
+        FAL_REQUEST_TIMEOUT_MS
+      );
+      const job = await withBytePlusQuotaRetry('motion submit', () =>
+        generateVideo({
+          adapter: createBytePlusVideo(request.modelId, apiKey, config),
+          prompt: request.prompt,
+          size: request.size,
+          ...(request.duration !== undefined && { duration: request.duration }),
+          modelOptions: request.modelOptions,
+          timeout: FAL_REQUEST_TIMEOUT_MS,
+          debug: false,
+        })
+      );
+      jobId = job.jobId;
+      break;
+    }
   }
 
   return {
     jobId,
     modelKey,
-    via: endpoint.via,
-    usedOwnKey: key.source === 'team',
+    via,
+    usedOwnKey: via === 'byteplus' ? false : key.source === 'team',
     submittedAt: Date.now(),
   };
 }
@@ -202,7 +250,6 @@ export async function pollMotionJob(
 
   // Native PRs widen MediaVia; this switch is the seam (#1216).
   switch (via) {
-    // oxlint-disable-next-line typescript/no-unnecessary-condition
     case 'fal': {
       const key = await resolveFalMotionKey(scopedDb);
       // Bound a single status fetch — the workflow already budgets total poll
@@ -219,6 +266,28 @@ export async function pollMotionJob(
         jobId,
       });
     }
+    case 'byteplus': {
+      const arkKey = getArkApiKey();
+      if (!arkKey) {
+        throw new Error(
+          'ARK_API_KEY is required to poll a BytePlus motion job'
+        );
+      }
+      const modelId = getBytePlusVideoModelId(modelKey);
+      if (!modelId) {
+        throw new Error(`No BytePlus model id for motion model "${modelKey}"`);
+      }
+      const { apiKey, ...config } = arkAdapterConfig(
+        arkKey,
+        FAL_REQUEST_TIMEOUT_MS
+      );
+      return await withBytePlusQuotaRetry('motion poll', () =>
+        getVideoJobStatus({
+          adapter: createBytePlusVideo(modelId, apiKey, config),
+          jobId,
+        })
+      );
+    }
   }
 }
 
@@ -229,7 +298,6 @@ export async function motionCostFromUsage(
 ) {
   // Native PRs widen MediaVia; this switch is the seam (#1216).
   switch (via) {
-    // oxlint-disable-next-line typescript/no-unnecessary-condition
     case 'fal': {
       const endpointId = resolveMotionEndpoint(
         ctx.modelKey,
@@ -240,6 +308,21 @@ export async function motionCostFromUsage(
         unitsBilled: usage?.unitsBilled,
         cost: await falCostFromUnits(endpointId, usage?.unitsBilled),
         recordFalUsage: true,
+      };
+    }
+    case 'byteplus': {
+      const endpointId = getBytePlusVideoModelId(ctx.modelKey);
+      if (!endpointId) {
+        throw new Error(
+          `No BytePlus model id for motion model "${ctx.modelKey}"`
+        );
+      }
+      const unitsBilled = bytePlusVideoUnitsBilled(usage?.totalTokens);
+      return {
+        endpointId,
+        unitsBilled,
+        cost: await falCostFromUnits(endpointId, unitsBilled),
+        recordFalUsage: false,
       };
     }
   }

@@ -1660,6 +1660,15 @@ export const ScenesView: React.FC<ScenesViewProps> = ({
                       sequenceExport={sequenceExport}
                       draftLabel={theatreDraftLabel(shots ?? [])}
                       variant="toolbar"
+                      publish={
+                        sequence
+                          ? {
+                              teamId: sequence.teamId,
+                              sequenceId: sequence.id,
+                              defaultTitle: sequence.title,
+                            }
+                          : undefined
+                      }
                     />
                   </>
                 }

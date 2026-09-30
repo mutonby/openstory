@@ -315,6 +315,10 @@ export function createApiKeysReadMethods(db: Database, teamId: string) {
       case 'llmtr':
         // Team BYOK only — OpenRouter/fal cover platform LLM calls.
         return undefined;
+      case 'upload_post':
+        // Publishing always posts to the team's OWN social accounts, so
+        // there is deliberately no platform-level fallback (#1267).
+        return undefined;
       default: {
         const _exhaustive: never = provider;
         throw new Error(`Unknown provider: ${String(_exhaustive)}`);
@@ -573,6 +577,21 @@ export function createApiKeysReadMethods(db: Database, teamId: string) {
           return { valid: false, error: 'LLMTR did not return a completion' };
         }
         return { valid: true };
+      }
+      case 'upload_post': {
+        // Key check: 200 live, 401/403 bad (the `Apikey` scheme, not Bearer).
+        const response = await fetch(
+          'https://api.upload-post.com/api/uploadposts/me',
+          { headers: { Authorization: `Apikey ${apiKey}` } }
+        );
+        if (response.ok) return { valid: true };
+        if (response.status === 401 || response.status === 403) {
+          return { valid: false, error: 'Invalid Upload-Post API key' };
+        }
+        return {
+          valid: false,
+          error: `Upload-Post returned ${response.status}`,
+        };
       }
       default: {
         const _exhaustive: never = provider;

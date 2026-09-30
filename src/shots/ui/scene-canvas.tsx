@@ -250,6 +250,11 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
               sequenceExport={sequenceExport}
               draftLabel={draftLabel}
               variant="overlay"
+              publish={{
+                teamId: sequence.teamId,
+                sequenceId: sequence.id,
+                defaultTitle: sequence.title,
+              }}
             />
           ) : undefined
         }

@@ -18,6 +18,12 @@ A share button (top-right corner of the player) opens a dropdown with:
 - **Copy video URL** — Copies the direct video URL to your clipboard
 - **Download video** — Downloads the `.mp4` file with a filename based on your sequence title (e.g., `My_Sequence_openstory.mp4`)
 
+### Publish to social
+
+If your team has added an Upload-Post key in **Settings → API Keys**, the Download menu also offers **Publish to social…** once the current cut has been rendered. Pick an Upload-Post profile, the platforms to post to (only the accounts connected to that profile are listed), a caption and an optional description. YouTube uploads default to private; TikTok uses your account's default unless you pick "Only me".
+
+You review exactly what will be posted before anything is sent, then follow each platform's result — a link to the post, or the reason it failed. Publishing the same thing twice is detected and not posted again.
+
 ## Video States
 
 ### Completed

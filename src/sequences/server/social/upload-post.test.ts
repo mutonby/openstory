@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { derivePublishRequestId } from '@/sequences/social-publish';
 import {
-  derivePublishRequestId,
   getUploadPostStatus,
   parseProfiles,
   parsePublishStatus,
   publishUploadPostVideo,
-  UploadPostRejectedError,
   type PublishVideoInput,
 } from './upload-post';
 
@@ -26,10 +25,12 @@ async function input(
   return {
     requestId: await derivePublishRequestId({
       teamId: '01TEAM',
+      sequenceId: '01SEQUENCE',
       exportId: '01EXPORT',
       profile: 'creator',
       platforms: ['tiktok', 'youtube'],
       title: 'My film',
+      description: '',
       youtubePrivacy: 'private',
       tiktokPrivacy: 'account_default',
     }),
@@ -37,6 +38,7 @@ async function input(
     platforms: ['tiktok', 'youtube'],
     videoUrl: 'https://cdn.example.com/exports/film.mp4',
     title: 'My film',
+    description: '',
     youtubePrivacy: 'private',
     tiktokPrivacy: 'account_default',
     externalId: '01EXPORT',
@@ -68,45 +70,6 @@ function stubFetch(handlers: {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-});
-
-describe('derivePublishRequestId', () => {
-  const base = {
-    teamId: '01TEAM',
-    exportId: '01EXPORT',
-    profile: 'creator',
-    platforms: ['tiktok', 'youtube'] as const,
-    title: 'My film',
-    youtubePrivacy: 'private',
-    tiktokPrivacy: 'account_default',
-  };
-
-  it('is stable for the same publish, whatever the platform order', async () => {
-    const a = await derivePublishRequestId(base);
-    const b = await derivePublishRequestId({
-      ...base,
-      platforms: ['youtube', 'tiktok'],
-    });
-    expect(a).toBe(b);
-    expect(a).toMatch(/^openstory-[0-9a-f]{32}$/);
-  });
-
-  it('changes when anything the user confirmed changes', async () => {
-    const original = await derivePublishRequestId(base);
-    for (const change of [
-      { exportId: '01OTHER' },
-      { profile: 'other' },
-      { platforms: ['tiktok'] as const },
-      { title: 'Another caption' },
-      { description: 'Now with a description' },
-      { youtubePrivacy: 'public' },
-      { tiktokPrivacy: 'SELF_ONLY' },
-    ]) {
-      expect(await derivePublishRequestId({ ...base, ...change })).not.toBe(
-        original
-      );
-    }
-  });
 });
 
 describe('publishUploadPostVideo', () => {
@@ -185,15 +148,40 @@ describe('publishUploadPostVideo', () => {
   });
 
   it.each([400, 401, 403, 422, 429])(
-    'rejects on a definitive HTTP %i with the API message',
+    'reports a definitive HTTP %i as not sent, with the API message',
     async (status) => {
       stubFetch({
         upload: () => jsonResponse(status, { message: 'Profile not found' }),
       });
 
-      await expect(publishUploadPostVideo(KEY, await input())).rejects.toEqual(
-        new UploadPostRejectedError('Profile not found', status)
-      );
+      expect(await publishUploadPostVideo(KEY, await input())).toEqual({
+        state: 'not_sent',
+        message: `Upload-Post refused the post (${status}): Profile not found`,
+      });
+    }
+  );
+
+  it.each([
+    ['a 500', () => jsonResponse(500, { message: 'down' })],
+    [
+      'a timeout',
+      () => {
+        throw new DOMException('timed out', 'TimeoutError');
+      },
+    ],
+    ['an unreadable reply', () => jsonResponse(200, { success: false })],
+  ])(
+    'sends nothing when the pre-send lookup fails with %s',
+    async (_, status) => {
+      const calls = stubFetch({
+        status,
+        upload: () => jsonResponse(200, {}),
+      });
+
+      const outcome = await publishUploadPostVideo(KEY, await input());
+
+      expect(outcome.state).toBe('not_sent');
+      expect(calls.upload).toBe(0);
     }
   );
 
@@ -273,7 +261,12 @@ describe('parsePublishStatus', () => {
           post_url: 'Post uploaded as Private. No public URL available.',
         },
         { platform: 'x', success: false, error_message: 'Token expired' },
-        { platform: 'linkedin', success: false, skipped: true },
+        {
+          platform: 'linkedin',
+          success: false,
+          skipped: true,
+          skip_reason: 'No LinkedIn account on this profile',
+        },
         {
           platform: 'tiktok',
           success: true,
@@ -310,7 +303,7 @@ describe('parsePublishStatus', () => {
         platform: 'linkedin',
         state: 'skipped',
         url: null,
-        note: 'No account connected on this profile.',
+        note: 'No LinkedIn account on this profile',
         error: null,
       },
       {
@@ -321,6 +314,27 @@ describe('parsePublishStatus', () => {
         error: null,
       },
     ]);
+  });
+
+  it('maps a top-level failure to failed, not done', () => {
+    expect(
+      parsePublishStatus({ status: 'failed', message: 'Video not found' })
+    ).toEqual({ state: 'failed', message: 'Video not found', results: [] });
+  });
+
+  it.each([{ success: false }, { status: 'mystery' }, 'oops', null])(
+    'throws on a reply it does not recognise: %j',
+    (payload) => {
+      expect(() => parsePublishStatus(payload)).toThrow(/Unexpected/);
+    }
+  );
+
+  it('keeps an unknown platform status pending, not failed', () => {
+    const status = parsePublishStatus({
+      status: 'processing',
+      results: [{ platform: 'youtube', status: 'uploading', success: false }],
+    });
+    expect(status.results[0]?.state).toBe('pending');
   });
 
   it('keeps retryable and queued platforms pending while the request runs', () => {
@@ -355,5 +369,10 @@ describe('parseProfiles', () => {
         ],
       })
     ).toEqual([{ username: 'creator', platforms: ['tiktok', 'youtube'] }]);
+  });
+
+  it('throws on a reply without a profiles list rather than showing none', () => {
+    expect(() => parseProfiles({ users: [] })).toThrow(/no profiles list/);
+    expect(parseProfiles({ profiles: [] })).toEqual([]);
   });
 });

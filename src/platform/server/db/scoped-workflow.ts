@@ -82,11 +82,27 @@ type WorkflowDomains = {
  * `hasUsableKey` is deliberately NOT here — "does this team own a key" is a
  * billing fact that gates a charge, so it lives under `liveRead.apiKeys`.
  */
+type ApiKeys = ScopedDb['apiKeys'];
+
+/**
+ * Keys a workflow may spend. `upload_post` (social publishing, #1267) is
+ * a team's own social accounts, not a generation provider — never resolved
+ * mid-run.
+ */
+type GenerationProvider = Exclude<
+  Parameters<ApiKeys['resolveKey']>[0],
+  'upload_post'
+>;
+
 type WorkflowCredentials = Pick<ScopedDb, 'teamId' | 'userId'> &
-  Pick<
-    ScopedDb['apiKeys'],
-    'resolveKey' | 'resolveOptionalKey' | 'resolveLlmKey'
-  >;
+  Pick<ApiKeys, 'resolveLlmKey'> & {
+    resolveKey: (
+      provider: GenerationProvider
+    ) => ReturnType<ApiKeys['resolveKey']>;
+    resolveOptionalKey: (
+      provider: GenerationProvider
+    ) => ReturnType<ApiKeys['resolveOptionalKey']>;
+  };
 
 /**
  * Hatch 2 — CLAIMS. Reads of append-only rows by an id the run already holds:
@@ -265,4 +281,4 @@ export function toWorkflowScopedDb(scopedDb: ScopedDb): WorkflowScopedDb {
  * reading env (#1552). Satisfied by `scopedDb.credentials`.
  */
 export type CredentialScopedDb = Pick<ScopedDb, 'userId'> &
-  Pick<ScopedDb['apiKeys'], 'resolveKey' | 'resolveOptionalKey'>;
+  Pick<WorkflowCredentials, 'resolveKey' | 'resolveOptionalKey'>;

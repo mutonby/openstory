@@ -870,4 +870,19 @@ describe('upload_post (social publishing, #1267)', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('throws on an outage rather than calling the key invalid', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('', { status: 503 }))
+    );
+    try {
+      const scope = createApiKeysReadMethods(db, teamId);
+      await expect(scope.validateKey('upload_post', 'good')).rejects.toThrow(
+        /unavailable \(503\)/
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

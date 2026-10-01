@@ -8,26 +8,32 @@
  * fetches the rendered MP4 itself and answers within seconds, so the Worker
  * never streams the file and never waits on the platforms.
  *
- * A publish must not happen twice. The request id is derived from exactly
- * what the user confirmed (export, profile, platforms, text), is sent as the
- * `Idempotency-Key`, and is looked up before anything is sent. Only a 4xx
- * that proves the request was refused is reported as a failure; a 5xx, a
- * dropped connection or an unreadable reply says nothing about whether the
- * post was created, so it is reported as `unconfirmed` and never retried.
+ * A publish must not happen twice. The request id is derived from every value
+ * the user reviewed (`derivePublishRequestId`), is sent as the
+ * `Idempotency-Key`, and is looked up before anything is sent — and if that
+ * lookup cannot answer, nothing is sent. Only a 4xx that proves the request
+ * was refused is reported as `not_sent`; a 5xx, a dropped connection or a
+ * timeout says nothing about whether the post was created, so it is reported
+ * as `unconfirmed` and never re-sent automatically.
+ *
+ * Status replies follow https://docs.upload-post.com/api/upload-status/. A
+ * reply in any other shape throws rather than being guessed at.
  *
  * Server-only: the caller resolves the team's `upload_post` key and passes it
  * in. Nothing here touches D1.
  */
 
+import { getLogger } from '@/platform/logger';
 import {
-  isSocialPlatform,
   SOCIAL_PLATFORMS,
   type PlatformPublishResult,
+  type PublishInput,
   type PublishOutcome,
   type PublishStatus,
-  type SocialPlatform,
   type SocialProfile,
 } from '@/sequences/social-publish';
+
+const logger = getLogger(['openstory', 'social', 'upload-post']);
 
 const UPLOAD_POST_API_URL = 'https://api.upload-post.com';
 
@@ -42,15 +48,18 @@ const READ_TIMEOUT_MS = 15_000;
  */
 const DEFINITIVE_REJECTIONS = new Set([400, 401, 402, 403, 404, 413, 422, 429]);
 
-export class UploadPostRejectedError extends Error {
-  constructor(
-    message: string,
-    readonly status: number
-  ) {
-    super(message);
-    this.name = 'UploadPostRejectedError';
-  }
-}
+const RUNNING_STATUSES = new Set([
+  'pending',
+  'queued',
+  'processing',
+  'in_progress',
+]);
+// Per platform; Upload-Post retries `retryable` ones itself.
+const PENDING_PLATFORM_STATUSES = new Set([
+  'queued',
+  'processing',
+  'retryable',
+]);
 
 function authHeaders(apiKey: string): Record<string, string> {
   // Upload-Post keys use the `Apikey` scheme, never `Bearer`.
@@ -78,43 +87,6 @@ async function readErrorMessage(response: Response): Promise<string> {
 }
 
 /**
- * Stable id for one publish: the same export, profile, platforms and text
- * always yield the same id, so a double click, a retry or a re-opened dialog
- * finds the earlier request instead of posting again. Anything the user
- * changes yields a new id, i.e. a new, separately confirmed publish.
- */
-export async function derivePublishRequestId(input: {
-  teamId: string;
-  exportId: string;
-  profile: string;
-  platforms: readonly SocialPlatform[];
-  title: string;
-  description?: string;
-  youtubePrivacy: string;
-  tiktokPrivacy: string;
-}): Promise<string> {
-  const canonical = JSON.stringify({
-    v: 1,
-    teamId: input.teamId,
-    exportId: input.exportId,
-    profile: input.profile,
-    platforms: [...input.platforms].sort(),
-    title: input.title,
-    description: input.description ?? '',
-    youtubePrivacy: input.youtubePrivacy,
-    tiktokPrivacy: input.tiktokPrivacy,
-  });
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(canonical)
-  );
-  const hex = Array.from(new Uint8Array(digest), (b) =>
-    b.toString(16).padStart(2, '0')
-  ).join('');
-  return `openstory-${hex.slice(0, 32)}`;
-}
-
-/**
  * Parse `GET /api/uploadposts/users`. A platform counts as connected when its
  * entry is a non-null object — Upload-Post returns `""`/`null` for a platform
  * that was added to the profile but never linked.
@@ -126,9 +98,8 @@ export function parseProfiles(payload: unknown): SocialProfile[] {
     !('profiles' in payload) ||
     !Array.isArray(payload.profiles)
   ) {
-    return [];
+    throw new Error('Unexpected reply from Upload-Post: no profiles list');
   }
-  const order = SOCIAL_PLATFORMS.map((p) => p.id);
   const profiles: SocialProfile[] = [];
   for (const entry of payload.profiles) {
     if (typeof entry !== 'object' || entry === null) continue;
@@ -137,13 +108,10 @@ export function parseProfiles(payload: unknown): SocialProfile[] {
     const accounts: unknown = Reflect.get(entry, 'social_accounts');
     const platforms =
       typeof accounts === 'object' && accounts !== null
-        ? Object.entries(accounts)
-            .filter(
-              ([, account]) => typeof account === 'object' && account !== null
-            )
-            .map(([platform]) => platform)
-            .filter(isSocialPlatform)
-            .sort((a, b) => order.indexOf(a) - order.indexOf(b))
+        ? SOCIAL_PLATFORMS.map((p) => p.id).filter((id) => {
+            const account: unknown = Reflect.get(accounts, id);
+            return typeof account === 'object' && account !== null;
+          })
         : [];
     profiles.push({ username, platforms });
   }
@@ -159,56 +127,79 @@ export async function listUploadPostProfiles(
   });
   if (!response.ok) {
     throw new Error(
-      `Could not load Upload-Post profiles: ${await readErrorMessage(response)}`
+      `Could not load Upload-Post profiles (${response.status}): ${await readErrorMessage(response)}`
     );
   }
   return parseProfiles(await response.json());
 }
 
+function platformState(entry: object): PlatformPublishResult['state'] {
+  const status = readString(entry, 'status');
+  if (Reflect.get(entry, 'skipped') === true || status === 'skipped') {
+    return 'skipped';
+  }
+  if (status === 'failed') return 'failed';
+  if (status === 'completed') return 'published';
+  if (status !== null) {
+    // Queued, processing, retryable — or a status this client doesn't know
+    // yet, which is not proof of failure.
+    if (!PENDING_PLATFORM_STATUSES.has(status)) {
+      logger.warn('Unknown Upload-Post platform status', { status });
+    }
+    return 'pending';
+  }
+  return Reflect.get(entry, 'success') === true ? 'published' : 'failed';
+}
+
 function parsePlatformResult(entry: object): PlatformPublishResult | null {
   const platform = readString(entry, 'platform');
-  if (!platform) return null;
+  if (!platform) {
+    logger.warn('Upload-Post platform result without a platform');
+    return null;
+  }
+  const state = platformState(entry);
   const rawUrl = readString(entry, 'post_url') ?? readString(entry, 'url');
   const url = rawUrl && /^https?:\/\//.test(rawUrl) ? rawUrl : null;
-  const inbox = Reflect.get(entry, 'fallback_to_inbox') === true;
-  const note = inbox
-    ? 'Sent to the TikTok inbox as a draft — publish it from the TikTok app.'
-    : url
-      ? null
-      : rawUrl;
-  const error =
-    readString(entry, 'error_message') ?? readString(entry, 'error');
 
-  let state: PlatformPublishResult['state'];
-  const perPlatform = readString(entry, 'status');
-  if (Reflect.get(entry, 'skipped') === true || perPlatform === 'skipped') {
-    state = 'skipped';
-  } else if (perPlatform === 'queued' || perPlatform === 'processing') {
-    state = 'pending';
-  } else if (perPlatform === 'retryable') {
-    // Upload-Post retries these itself.
-    state = 'pending';
-  } else {
-    state = Reflect.get(entry, 'success') === true ? 'published' : 'failed';
+  let note: string | null = url ? null : rawUrl;
+  if (state === 'skipped') {
+    note = readString(entry, 'skip_reason') ?? 'Skipped by Upload-Post.';
+  } else if (Reflect.get(entry, 'fallback_to_inbox') === true) {
+    note =
+      'Sent to the TikTok inbox as a draft — publish it from the TikTok app.';
   }
+
+  const error =
+    readString(entry, 'error_message') ??
+    readString(entry, 'error') ??
+    readString(entry, 'message');
   return {
     platform,
     state,
     url,
-    note: state === 'skipped' ? 'No account connected on this profile.' : note,
+    note,
     error: state === 'failed' ? (error ?? 'Publishing failed') : null,
   };
 }
 
 /**
  * Parse `GET /api/uploadposts/status`. Platforms still in flight may not be
- * listed yet; the top-level status says whether more are coming.
+ * listed yet; the top-level status says whether more are coming. Throws on a
+ * status it doesn't recognise, so nothing downstream mistakes an unreadable
+ * reply for "already sent".
  */
 export function parsePublishStatus(payload: unknown): PublishStatus {
   if (typeof payload !== 'object' || payload === null) {
-    return { state: 'running', message: null, results: [] };
+    throw new Error('Unexpected Upload-Post status reply');
   }
   const raw = readString(payload, 'status');
+  let state: PublishStatus['state'];
+  if (raw === 'not_found') state = 'not_found';
+  else if (raw === 'completed') state = 'done';
+  else if (raw === 'failed') state = 'failed';
+  else if (raw !== null && RUNNING_STATUSES.has(raw)) state = 'running';
+  else throw new Error(`Unexpected Upload-Post status: ${raw ?? 'none'}`);
+
   const results: PlatformPublishResult[] = [];
   const rawResults: unknown = Reflect.get(payload, 'results');
   if (Array.isArray(rawResults)) {
@@ -218,12 +209,6 @@ export function parsePublishStatus(payload: unknown): PublishStatus {
       if (parsed) results.push(parsed);
     }
   }
-  const state: PublishStatus['state'] =
-    raw === 'not_found'
-      ? 'not_found'
-      : raw === 'completed' || raw === 'failed'
-        ? 'done'
-        : 'running';
   return { state, message: readString(payload, 'message'), results };
 }
 
@@ -242,24 +227,25 @@ export async function getUploadPostStatus(
   }
   if (!response.ok) {
     throw new Error(
-      `Could not read publish status: ${await readErrorMessage(response)}`
+      `Could not read publish status (${response.status}): ${await readErrorMessage(response)}`
     );
   }
   return parsePublishStatus(await response.json());
 }
 
-export type PublishVideoInput = {
+export type PublishVideoInput = Pick<
+  PublishInput,
+  | 'profile'
+  | 'platforms'
+  | 'title'
+  | 'description'
+  | 'youtubePrivacy'
+  | 'tiktokPrivacy'
+> & {
+  /** From `derivePublishRequestId` over the same values. */
   requestId: string;
-  /** Upload-Post profile username. */
-  profile: string;
-  platforms: SocialPlatform[];
   /** Publicly fetchable MP4 URL — Upload-Post downloads it itself. */
   videoUrl: string;
-  title: string;
-  description?: string;
-  youtubePrivacy: string;
-  /** `account_default` sends nothing and keeps the account's own setting. */
-  tiktokPrivacy: string;
   /** Echoed back by Upload-Post's status and history. */
   externalId: string;
 };
@@ -268,22 +254,35 @@ export type PublishVideoInput = {
  * Hand the export to Upload-Post, at most once per request id.
  *
  * 1. Look the request id up first: if Upload-Post already has it, report
- *    `resumed` and send nothing.
+ *    `resumed` and send nothing. If the lookup fails, send nothing either —
+ *    after the 24-hour `Idempotency-Key` window it is the only guard.
  * 2. Otherwise POST with the same id as `request_id` and `Idempotency-Key`.
- * 3. A definitive 4xx throws `UploadPostRejectedError`. A 5xx, a timeout or a
- *    dropped connection returns `unconfirmed` — the caller keeps polling the
- *    id and never offers to send it again.
+ * 3. A definitive 4xx is `not_sent`. A 5xx, a timeout or a dropped
+ *    connection is `unconfirmed` — the caller keeps polling the id and never
+ *    re-sends it automatically.
  */
 export async function publishUploadPostVideo(
   apiKey: string,
   input: PublishVideoInput
 ): Promise<PublishOutcome> {
   const { requestId } = input;
+  const log = { requestId, externalId: input.externalId };
 
-  const existing = await getUploadPostStatus(apiKey, requestId).catch(
-    () => null
-  );
-  if (existing && existing.state !== 'not_found') {
+  let existing: PublishStatus;
+  try {
+    existing = await getUploadPostStatus(apiKey, requestId);
+  } catch (error) {
+    logger.warn('Upload-Post lookup failed; not sending', {
+      ...log,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      state: 'not_sent',
+      message:
+        "Couldn't check with Upload-Post whether this was already posted, so nothing was sent. Try again.",
+    };
+  }
+  if (existing.state !== 'not_found') {
     return { requestId, state: 'resumed' };
   }
 
@@ -304,8 +303,8 @@ export async function publishUploadPostVideo(
   }
   form.set('external_id', input.externalId);
   form.set('request_id', requestId);
-  // Every OpenStory export is AI-generated: TikTok, Instagram, YouTube and X
-  // show their AI label from this one flag.
+  // Every OpenStory export is AI-generated; Upload-Post applies the AI label
+  // on the platforms that support one.
   form.set('is_ai_generated', 'true');
   form.set('async_upload', 'true');
 
@@ -317,19 +316,34 @@ export async function publishUploadPostVideo(
       body: form,
       signal: AbortSignal.timeout(PUBLISH_TIMEOUT_MS),
     });
-  } catch {
+  } catch (error) {
     // The request may have reached Upload-Post before the connection dropped.
+    logger.warn('Upload-Post publish unconfirmed: no response', {
+      ...log,
+      error: error instanceof Error ? error.name : String(error),
+    });
     return { requestId, state: 'unconfirmed' };
   }
 
   // Any 2xx means accepted, even with an empty or non-JSON body.
   if (response.ok) return { requestId, state: 'submitted' };
 
+  const message = await readErrorMessage(response);
   if (DEFINITIVE_REJECTIONS.has(response.status)) {
-    throw new UploadPostRejectedError(
-      await readErrorMessage(response),
-      response.status
-    );
+    logger.info('Upload-Post refused the publish', {
+      ...log,
+      status: response.status,
+      message,
+    });
+    return {
+      state: 'not_sent',
+      message: `Upload-Post refused the post (${response.status}): ${message}`,
+    };
   }
+  logger.warn('Upload-Post publish unconfirmed', {
+    ...log,
+    status: response.status,
+    message,
+  });
   return { requestId, state: 'unconfirmed' };
 }

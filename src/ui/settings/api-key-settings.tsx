@@ -34,6 +34,7 @@ import { getCurrentUserProfileFn } from '@/platform/user.fn';
 import { BILLING_GATE_KEY } from '@/billing/ui/use-billing-gate';
 import { usePostHog } from '@posthog/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { ApiKeyProvider } from '@/platform/server/db/schema';
 import { useNavigate } from '@tanstack/react-router';
 import { AlertTriangle, ExternalLink, RotateCcw, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -44,13 +45,7 @@ type ApiKeySettingsProps = {
   error?: string;
 };
 
-type ApiKeyProviderId =
-  | 'openrouter'
-  | 'fal'
-  | 'xai'
-  | 'google'
-  | 'llmtr'
-  | 'upload_post';
+type ApiKeyProviderId = ApiKeyProvider;
 /** Providers whose key is pasted in — OpenRouter alone uses OAuth. */
 type ManualProvider = Exclude<ApiKeyProviderId, 'openrouter'>;
 
@@ -143,6 +138,10 @@ function ApiKeySettingsContent({
     void queryClient.invalidateQueries({ queryKey: ['apiKeys', teamId] });
     void queryClient.invalidateQueries({ queryKey: ['apiKeyStatus', teamId] });
     void queryClient.invalidateQueries({ queryKey: [...BILLING_GATE_KEY] });
+    // The Download menu's "Publish to social…" follows the Upload-Post key.
+    void queryClient.invalidateQueries({
+      queryKey: ['social-publishing', teamId],
+    });
   };
 
   const saveKeyMutation = useMutation({

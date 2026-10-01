@@ -20,7 +20,7 @@ import type { SequenceExportState } from '@/sequences/ui/theatre/use-sequence-ex
 import { PublishDialog } from '@/sequences/ui/theatre/publish-dialog';
 import { getSocialPublishingFn } from '@/sequences/social-publish.fn';
 import { cn } from '@/ui/utils';
-import { useQuery } from '@tanstack/react-query';
+import { skipToken, useQuery } from '@tanstack/react-query';
 import {
   ChevronDown,
   CircleStop,
@@ -83,12 +83,12 @@ export const SequenceDownloadMenu: React.FC<{
           : 'Not rendered yet';
   const { data: publishing } = useQuery({
     queryKey: ['social-publishing', publish?.teamId],
-    queryFn: () =>
-      getSocialPublishingFn({ data: { teamId: publish?.teamId ?? '' } }),
-    enabled: Boolean(publish),
+    queryFn: publish
+      ? () => getSocialPublishingFn({ data: { teamId: publish.teamId } })
+      : skipToken,
     staleTime: 5 * 60 * 1000,
   });
-  const canPublish = Boolean(publish && publishing?.enabled);
+  const canPublish = publishing?.enabled === true;
   // The render the dialog publishes is the one on screen when it was opened.
   const [publishExportId, setPublishExportId] = useState<string | null>(null);
 
@@ -203,10 +203,7 @@ export const SequenceDownloadMenu: React.FC<{
       </DropdownMenu>
       {publish && publishExportId && (
         <PublishDialog
-          open
-          onOpenChange={(open) => {
-            if (!open) setPublishExportId(null);
-          }}
+          onClose={() => setPublishExportId(null)}
           teamId={publish.teamId}
           sequenceId={publish.sequenceId}
           exportId={publishExportId}

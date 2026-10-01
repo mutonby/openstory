@@ -4,8 +4,9 @@
  * (`server/social/upload-post.ts`) on the team's own key (`team_api_keys`,
  * provider `upload_post`), resolved server-side; it never reaches the browser.
  *
- *   - `getSocialPublishingFn`     — `{ enabled }`: whether the team has a key.
- *                                   The menu item only exists when it does.
+ *   - `getSocialPublishingFn`     — `{ enabled }`: whether the team has an
+ *                                   active, valid key. The menu item only
+ *                                   exists when it does.
  *   - `listSocialProfilesFn`      — profiles + their connected platforms.
  *   - `publishSequenceExportFn`   — hand a `ready` export to Upload-Post by URL.
  *   - `getSocialPublishStatusFn`  — per-platform outcome of a publish.
@@ -19,30 +20,40 @@ import {
   sequenceAccessMiddleware,
   teamMemberAccessMiddleware,
 } from '@/platform/middleware.fn';
+import { getLogger } from '@/platform/logger';
+import { requireTeamMemberAccess } from '@/platform/server/auth/action-utils';
+import type { ScopedDb } from '@/platform/server/db/scoped';
 import { ulidSchema } from '@/platform/server/schemas/id.schemas';
 import { getProductionDeploymentAppUrl } from '@/platform/server/env/environment';
 import { toShareableUrl } from '@/platform/server/storage/buckets';
-import { publishInputSchema } from '@/sequences/social-publish';
 import {
   derivePublishRequestId,
+  publishInputSchema,
+  PUBLISH_REQUEST_ID_RE,
+  type PublishOutcome,
+} from '@/sequences/social-publish';
+import {
+  assertPublicVideoUrl,
+  assertPublishableExport,
+} from '@/sequences/server/social/publish-guards';
+import {
   getUploadPostStatus,
   listUploadPostProfiles,
   publishUploadPostVideo,
 } from '@/sequences/server/social/upload-post';
 
-const NO_KEY_MESSAGE =
-  'Add an Upload-Post API key in Settings → API Keys to publish to social media.';
+const logger = getLogger(['openstory', 'serverFn', 'social-publish']);
 
-type ApiKeysReader = {
-  resolveOptionalKey: (
-    provider: 'upload_post'
-  ) => Promise<{ key: string } | undefined>;
-};
-
-async function requireUploadPostKey(apiKeys: ApiKeysReader): Promise<string> {
+async function requireUploadPostKey(
+  apiKeys: Pick<ScopedDb['apiKeys'], 'resolveOptionalKey' | 'hasInvalidKey'>
+): Promise<string> {
   const resolved = await apiKeys.resolveOptionalKey('upload_post');
-  if (!resolved) throw new Error(NO_KEY_MESSAGE);
-  return resolved.key;
+  if (resolved) return resolved.key;
+  throw new Error(
+    (await apiKeys.hasInvalidKey('upload_post'))
+      ? 'Your Upload-Post API key failed its last check. Re-check or replace it in Settings → API Keys.'
+      : 'Add an Upload-Post API key in Settings → API Keys to publish to social media.'
+  );
 }
 
 export const getSocialPublishingFn = createServerFn({ method: 'GET' })
@@ -63,54 +74,46 @@ export const listSocialProfilesFn = createServerFn({ method: 'GET' })
 export const publishSequenceExportFn = createServerFn({ method: 'POST' })
   .middleware([sequenceAccessMiddleware])
   .validator(zodValidator(publishInputSchema))
-  .handler(async ({ context, data }) => {
-    const apiKey = await requireUploadPostKey(context.scopedDb.apiKeys);
-
-    // The export must belong to the sequence the middleware just authorised —
-    // `getById` alone would let a caller publish another team's file.
-    const exportRow = await context.scopedDb.sequenceExports.getById(
-      data.exportId
-    );
-    if (!exportRow || exportRow.sequenceId !== context.sequence.id) {
-      throw new Error('Export not found for this sequence');
-    }
-    if (exportRow.status !== 'ready') {
-      throw new Error(`Export is ${exportRow.status}, not ready to publish`);
-    }
-
-    // Stored URLs are origin-relative (#894). Upload-Post fetches the MP4
-    // from its side, so absolutize it: CDN domain in prod, else the app URL.
-    const videoUrl = toShareableUrl(
-      exportRow.url,
-      getProductionDeploymentAppUrl(getRequest())
-    );
-    if (!videoUrl.startsWith('https://') || isLocalUrl(videoUrl)) {
-      throw new Error(
-        'This render is not reachable from the internet, so Upload-Post cannot fetch it. Publishing works on a deployed OpenStory.'
+  .handler(async ({ context, data }): Promise<PublishOutcome> => {
+    const { sequence, scopedDb } = context;
+    let prepared: { apiKey: string; videoUrl: string; requestId: string };
+    // Every refusal here happens before anything is sent, so it is `not_sent`
+    // — the dialog treats a thrown error as "maybe sent" and keeps tracking.
+    try {
+      // A system admin opening another team's sequence gets that team's
+      // scopedDb (and key). Reading is an admin power; posting on the team's
+      // own social accounts is not.
+      await requireTeamMemberAccess(context.user.id, sequence.teamId);
+      const apiKey = await requireUploadPostKey(scopedDb.apiKeys);
+      const exportRow = await scopedDb.sequenceExports.getById(data.exportId);
+      assertPublishableExport(exportRow, sequence.id);
+      // Stored URLs are origin-relative (#894): CDN domain in prod, else the
+      // app URL.
+      const videoUrl = toShareableUrl(
+        exportRow.url,
+        getProductionDeploymentAppUrl(getRequest())
       );
+      assertPublicVideoUrl(videoUrl);
+      const requestId = await derivePublishRequestId({
+        ...data,
+        teamId: sequence.teamId,
+      });
+      prepared = { apiKey, videoUrl, requestId };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.info('Publish refused before sending', {
+        teamId: sequence.teamId,
+        exportId: data.exportId,
+        message,
+      });
+      return { state: 'not_sent', message };
     }
 
-    const requestId = await derivePublishRequestId({
-      teamId: context.teamId,
-      exportId: exportRow.id,
-      profile: data.profile,
-      platforms: data.platforms,
-      title: data.title,
-      description: data.description,
-      youtubePrivacy: data.youtubePrivacy,
-      tiktokPrivacy: data.tiktokPrivacy,
-    });
-
-    return publishUploadPostVideo(apiKey, {
-      requestId,
-      profile: data.profile,
-      platforms: data.platforms,
-      videoUrl,
-      title: data.title,
-      description: data.description,
-      youtubePrivacy: data.youtubePrivacy,
-      tiktokPrivacy: data.tiktokPrivacy,
-      externalId: exportRow.id,
+    return publishUploadPostVideo(prepared.apiKey, {
+      ...data,
+      requestId: prepared.requestId,
+      videoUrl: prepared.videoUrl,
+      externalId: data.exportId,
     });
   });
 
@@ -120,7 +123,7 @@ export const getSocialPublishStatusFn = createServerFn({ method: 'GET' })
     zodValidator(
       z.object({
         teamId: ulidSchema,
-        requestId: z.string().regex(/^openstory-[0-9a-f]{32}$/),
+        requestId: z.string().regex(PUBLISH_REQUEST_ID_RE),
       })
     )
   )
@@ -128,12 +131,3 @@ export const getSocialPublishStatusFn = createServerFn({ method: 'GET' })
     const apiKey = await requireUploadPostKey(context.scopedDb.apiKeys);
     return getUploadPostStatus(apiKey, data.requestId);
   });
-
-function isLocalUrl(url: string): boolean {
-  const { hostname } = new URL(url);
-  return (
-    hostname === 'localhost' ||
-    hostname === '127.0.0.1' ||
-    hostname.endsWith('.localhost')
-  );
-}

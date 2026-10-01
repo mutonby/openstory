@@ -2,8 +2,13 @@
  * Publish to social (#1267). Three steps: pick the profile, platforms and
  * caption; review exactly what will be sent; then follow each platform's
  * outcome. What the review shows is what the server receives — changing
- * anything means going back and reviewing again, and the server derives the
- * request id from those same values, so a repeat is found, not re-posted.
+ * anything means going back and reviewing again, and the request id is
+ * derived from those same values, so a repeat is found, not re-posted.
+ *
+ * Once a publish may have gone out, its tracking outlives the dialog: closing
+ * and re-opening shows the same request, never a fresh form, until it has
+ * definitely finished or failed. A lost reply from our own server counts as
+ * "may have gone out" too.
  */
 
 import { Button } from '@/ui/shadcn/button';
@@ -33,24 +38,61 @@ import {
   publishSequenceExportFn,
 } from '@/sequences/social-publish.fn';
 import {
+  captionLimit,
+  derivePublishRequestId,
   publishInputSchema,
   socialPlatformLabel,
   SOCIAL_PLATFORMS,
   TIKTOK_PRIVACY,
+  TIKTOK_PRIVACY_LABELS,
   YOUTUBE_PRIVACY,
-  YOUTUBE_TITLE_MAX,
+  YOUTUBE_PRIVACY_LABELS,
   type PublishInput,
   type PublishOutcome,
+  type PublishStatus,
   type SocialPlatform,
-  type SocialProfile,
 } from '@/sequences/social-publish';
 import { usePostHog } from '@posthog/react';
-import { useMutation, useQuery, useSuspenseQuery } from '@tanstack/react-query';
-import { Suspense, useEffect, useId, useState } from 'react';
+import {
+  QueryErrorResetBoundary,
+  useMutation,
+  useQuery,
+  useSuspenseQuery,
+} from '@tanstack/react-query';
+import { CatchBoundary } from '@tanstack/react-router';
+import { Suspense, useId, useState, useSyncExternalStore } from 'react';
+
+type Tracked = Exclude<PublishOutcome, { state: 'not_sent' }> & {
+  startedAt: number;
+};
+
+// Publishes that may have gone out, by export id. Page memory, so it survives
+// the dialog closing and is shared by both Download menus; a reload drops it,
+// and then the server's own lookup finds a repeat of the same post.
+const tracked = new Map<string, Tracked>();
+const trackedListeners = new Set<() => void>();
+
+function setTracked(exportId: string, value: Tracked | null): void {
+  if (value) tracked.set(exportId, value);
+  else tracked.delete(exportId);
+  for (const listener of trackedListeners) listener();
+}
+
+function subscribeTracked(listener: () => void): () => void {
+  trackedListeners.add(listener);
+  return () => trackedListeners.delete(listener);
+}
+
+function useTracked(exportId: string): Tracked | null {
+  return useSyncExternalStore(
+    subscribeTracked,
+    () => tracked.get(exportId) ?? null,
+    () => null
+  );
+}
 
 type PublishDialogProps = {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+  onClose: () => void;
   teamId: string;
   sequenceId: string;
   /** The ready render of the current cut. Captured when the dialog opens. */
@@ -59,20 +101,21 @@ type PublishDialogProps = {
 };
 
 type Step =
-  | { kind: 'form' }
-  | { kind: 'review'; input: PublishInput }
-  | { kind: 'tracking'; outcome: PublishOutcome; startedAt: number };
+  | { kind: 'form'; draft: PublishInput | null }
+  | { kind: 'review'; input: PublishInput };
 
 export function PublishDialog(props: PublishDialogProps) {
-  const [step, setStep] = useState<Step>({ kind: 'form' });
-
-  const onOpenChange = (open: boolean) => {
-    if (!open) setStep({ kind: 'form' });
-    props.onOpenChange(open);
-  };
+  const { onClose, teamId, exportId } = props;
+  const current = useTracked(exportId);
+  const [step, setStep] = useState<Step>({ kind: 'form', draft: null });
 
   return (
-    <Dialog open={props.open} onOpenChange={onOpenChange}>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
       <DialogContent className="max-h-[90dvh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Publish to social</DialogTitle>
@@ -80,44 +123,73 @@ export function PublishDialog(props: PublishDialogProps) {
             Post this render to your connected accounts through Upload-Post.
           </DialogDescription>
         </DialogHeader>
-        {step.kind === 'form' && (
-          <Suspense fallback={<FormSkeleton />}>
-            <PublishForm
-              {...props}
-              onReview={(input) => setStep({ kind: 'review', input })}
-              onCancel={() => onOpenChange(false)}
-            />
-          </Suspense>
-        )}
-        {step.kind === 'review' && (
+        {current ? (
+          <PublishTracking
+            teamId={teamId}
+            tracked={current}
+            onClose={onClose}
+            onNewPost={() => {
+              setStep({ kind: 'form', draft: null });
+              setTracked(exportId, null);
+            }}
+          />
+        ) : step.kind === 'review' ? (
           <PublishReview
+            teamId={teamId}
             input={step.input}
-            onBack={() => setStep({ kind: 'form' })}
+            onBack={() => setStep({ kind: 'form', draft: step.input })}
             onPublished={(outcome) =>
-              setStep({ kind: 'tracking', outcome, startedAt: Date.now() })
+              setTracked(exportId, { ...outcome, startedAt: Date.now() })
             }
           />
-        )}
-        {step.kind === 'tracking' && (
-          <PublishTracking
-            teamId={props.teamId}
-            outcome={step.outcome}
-            startedAt={step.startedAt}
-            onClose={() => onOpenChange(false)}
-          />
+        ) : (
+          <QueryErrorResetBoundary>
+            {({ reset: resetQueries }) => (
+              <CatchBoundary
+                getResetKey={() => exportId}
+                errorComponent={({ error, reset }) => (
+                  <div className="flex flex-col gap-4">
+                    <p role="alert" className="text-sm text-destructive">
+                      {error.message}
+                    </p>
+                    <DialogFooter>
+                      <Button type="button" variant="outline" onClick={onClose}>
+                        Close
+                      </Button>
+                      <Button
+                        type="button"
+                        onClick={() => {
+                          resetQueries();
+                          reset();
+                        }}
+                      >
+                        Try again
+                      </Button>
+                    </DialogFooter>
+                  </div>
+                )}
+              >
+                <Suspense
+                  fallback={
+                    <div className="flex flex-col gap-4">
+                      <Skeleton className="h-10 w-full" />
+                      <Skeleton className="h-24 w-full" />
+                      <Skeleton className="h-10 w-full" />
+                    </div>
+                  }
+                >
+                  <PublishForm
+                    {...props}
+                    draft={step.draft}
+                    onReview={(input) => setStep({ kind: 'review', input })}
+                  />
+                </Suspense>
+              </CatchBoundary>
+            )}
+          </QueryErrorResetBoundary>
         )}
       </DialogContent>
     </Dialog>
-  );
-}
-
-function FormSkeleton() {
-  return (
-    <div className="flex flex-col gap-4">
-      <Skeleton className="h-10 w-full" />
-      <Skeleton className="h-24 w-full" />
-      <Skeleton className="h-10 w-full" />
-    </div>
   );
 }
 
@@ -126,41 +198,47 @@ function PublishForm({
   sequenceId,
   exportId,
   defaultTitle,
+  draft,
   onReview,
-  onCancel,
+  onClose,
 }: PublishDialogProps & {
+  draft: PublishInput | null;
   onReview: (input: PublishInput) => void;
-  onCancel: () => void;
 }) {
-  const ids = {
-    title: useId(),
-    description: useId(),
-    privacy: useId(),
-    tiktokPrivacy: useId(),
-  };
+  const id = useId();
   const { data: profiles } = useSuspenseQuery({
     queryKey: ['social-profiles', teamId],
     queryFn: () => listSocialProfilesFn({ data: { teamId } }),
     staleTime: 60_000,
   });
   const [profileName, setProfileName] = useState(
-    profiles.length === 1 ? (profiles[0]?.username ?? '') : ''
+    draft?.profile ??
+      (profiles.length === 1 ? (profiles[0]?.username ?? '') : '')
   );
-  const [platforms, setPlatforms] = useState<SocialPlatform[]>([]);
+  const [platforms, setPlatforms] = useState<SocialPlatform[]>(
+    draft?.platforms ?? []
+  );
   const [error, setError] = useState<string | null>(null);
-  const profile: SocialProfile | undefined = profiles.find(
-    (p) => p.username === profileName
-  );
+  const profile = profiles.find((p) => p.username === profileName);
+  const limit = captionLimit(platforms);
 
   if (profiles.length === 0) {
     return (
       <div className="flex flex-col gap-4">
         <p className="text-sm text-muted-foreground">
-          Your Upload-Post account has no profiles yet. Create one and connect
-          your social accounts at app.upload-post.com, then come back.
+          No Upload-Post profiles. Create one at{' '}
+          <a
+            href="https://app.upload-post.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline underline-offset-2"
+          >
+            app.upload-post.com
+          </a>
+          .
         </p>
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={onCancel}>
+          <Button type="button" variant="outline" onClick={onClose}>
             Close
           </Button>
         </DialogFooter>
@@ -177,9 +255,9 @@ function PublishForm({
       profile: profileName,
       platforms,
       title: form.get('title'),
-      description: form.get('description') || undefined,
-      youtubePrivacy: form.get('youtubePrivacy') ?? 'private',
-      tiktokPrivacy: form.get('tiktokPrivacy') ?? 'account_default',
+      description: form.get('description'),
+      youtubePrivacy: form.get('youtubePrivacy'),
+      tiktokPrivacy: form.get('tiktokPrivacy'),
     });
     if (!parsed.success) {
       setError(parsed.error.issues[0]?.message ?? 'Check the form');
@@ -245,65 +323,80 @@ function PublishForm({
       )}
 
       <div className="flex flex-col gap-2">
-        <Label htmlFor={ids.title}>Caption</Label>
+        <Label htmlFor={`${id}-title`}>Caption</Label>
         <Input
-          id={ids.title}
+          id={`${id}-title`}
           name="title"
-          defaultValue={defaultTitle}
+          defaultValue={draft?.title ?? defaultTitle}
           required
           autoComplete="off"
         />
-        {platforms.includes('youtube') && (
+        {limit && (
           <p className="text-xs text-muted-foreground">
-            Also the YouTube title — {YOUTUBE_TITLE_MAX} characters max.
+            {limit.label}: {limit.max} characters max.
           </p>
         )}
       </div>
 
       <div className="flex flex-col gap-2">
-        <Label htmlFor={ids.description}>Description (optional)</Label>
-        <Textarea id={ids.description} name="description" rows={3} />
+        <Label htmlFor={`${id}-description`}>Description (optional)</Label>
+        <Textarea
+          id={`${id}-description`}
+          name="description"
+          rows={3}
+          defaultValue={draft?.description}
+        />
         <p className="text-xs text-muted-foreground">
           Used on YouTube, LinkedIn and Facebook.
         </p>
       </div>
 
-      {platforms.includes('youtube') && (
-        <div className="flex flex-col gap-2">
-          <Label htmlFor={ids.privacy}>YouTube visibility</Label>
-          <Select name="youtubePrivacy" defaultValue="private">
-            <SelectTrigger id={ids.privacy}>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {YOUTUBE_PRIVACY.map((value) => (
-                <SelectItem key={value} value={value}>
-                  {value[0]?.toUpperCase()}
-                  {value.slice(1)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      )}
+      {/* Hidden, not unmounted, so the form always submits both values. */}
+      <div
+        className={
+          platforms.includes('youtube') ? 'flex flex-col gap-2' : 'hidden'
+        }
+      >
+        <Label htmlFor={`${id}-youtube`}>YouTube visibility</Label>
+        <Select
+          name="youtubePrivacy"
+          defaultValue={draft?.youtubePrivacy ?? 'private'}
+        >
+          <SelectTrigger id={`${id}-youtube`}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {YOUTUBE_PRIVACY.map((value) => (
+              <SelectItem key={value} value={value}>
+                {YOUTUBE_PRIVACY_LABELS[value]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
-      {platforms.includes('tiktok') && (
-        <div className="flex flex-col gap-2">
-          <Label htmlFor={ids.tiktokPrivacy}>TikTok visibility</Label>
-          <Select name="tiktokPrivacy" defaultValue="account_default">
-            <SelectTrigger id={ids.tiktokPrivacy}>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {TIKTOK_PRIVACY.map((value) => (
-                <SelectItem key={value} value={value}>
-                  {TIKTOK_PRIVACY_LABELS[value]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      )}
+      <div
+        className={
+          platforms.includes('tiktok') ? 'flex flex-col gap-2' : 'hidden'
+        }
+      >
+        <Label htmlFor={`${id}-tiktok`}>TikTok visibility</Label>
+        <Select
+          name="tiktokPrivacy"
+          defaultValue={draft?.tiktokPrivacy ?? 'account_default'}
+        >
+          <SelectTrigger id={`${id}-tiktok`}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TIKTOK_PRIVACY.map((value) => (
+              <SelectItem key={value} value={value}>
+                {TIKTOK_PRIVACY_LABELS[value]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
       {error && (
         <p role="alert" className="text-sm text-destructive">
@@ -312,7 +405,7 @@ function PublishForm({
       )}
 
       <DialogFooter>
-        <Button type="button" variant="outline" onClick={onCancel}>
+        <Button type="button" variant="outline" onClick={onClose}>
           Cancel
         </Button>
         <Button type="submit" disabled={platforms.length === 0}>
@@ -324,26 +417,41 @@ function PublishForm({
 }
 
 function PublishReview({
+  teamId,
   input,
   onBack,
   onPublished,
 }: {
+  teamId: string;
   input: PublishInput;
   onBack: () => void;
-  onPublished: (outcome: PublishOutcome) => void;
+  onPublished: (outcome: Omit<Tracked, 'startedAt'>) => void;
 }) {
   const posthog = usePostHog();
   const publish = useMutation({
-    mutationFn: () => publishSequenceExportFn({ data: input }),
+    mutationFn: async (): Promise<PublishOutcome> => {
+      const requestId = await derivePublishRequestId({ ...input, teamId });
+      try {
+        return await publishSequenceExportFn({ data: input });
+      } catch {
+        // Our server's reply was lost or it failed mid-call, so the post may
+        // have gone out. Track the request rather than offer an edit — an
+        // edited resend would be a new request id, i.e. a second post.
+        return { requestId, state: 'unconfirmed' };
+      }
+    },
     onSuccess: (outcome) => {
+      if (outcome.state === 'not_sent') return;
+      onPublished(outcome);
       posthog.capture('social_publish_submitted', {
         sequence_id: input.sequenceId,
         platforms: input.platforms,
         state: outcome.state,
       });
-      onPublished(outcome);
     },
   });
+  const notSent =
+    publish.data?.state === 'not_sent' ? publish.data.message : null;
 
   return (
     <div className="flex flex-col gap-4">
@@ -365,15 +473,13 @@ function PublishReview({
         {input.platforms.includes('youtube') && (
           <>
             <dt className="text-muted-foreground">YouTube</dt>
-            <dd>{input.youtubePrivacy ?? 'private'}</dd>
+            <dd>{YOUTUBE_PRIVACY_LABELS[input.youtubePrivacy]}</dd>
           </>
         )}
         {input.platforms.includes('tiktok') && (
           <>
             <dt className="text-muted-foreground">TikTok</dt>
-            <dd>
-              {TIKTOK_PRIVACY_LABELS[input.tiktokPrivacy ?? 'account_default']}
-            </dd>
+            <dd>{TIKTOK_PRIVACY_LABELS[input.tiktokPrivacy]}</dd>
           </>
         )}
       </dl>
@@ -381,9 +487,9 @@ function PublishReview({
         Posts are labelled as AI-generated where the platform supports it.
         Published posts can't be undone from here.
       </p>
-      {publish.error && (
+      {notSent && (
         <p role="alert" className="text-sm text-destructive">
-          {publish.error.message}
+          Not sent: {notSent}
         </p>
       )}
       <DialogFooter>
@@ -407,86 +513,105 @@ function PublishReview({
   );
 }
 
-const TIKTOK_PRIVACY_LABELS: Record<(typeof TIKTOK_PRIVACY)[number], string> = {
-  account_default: "Account's default",
-  SELF_ONLY: 'Only me',
-};
-
 // Upload-Post caches "not found" for a short while, and an unconfirmed call
 // may still be registering, so give the request id this long to appear
 // before saying it could not be confirmed.
 const REGISTER_GRACE_MS = 2 * 60 * 1000;
+// Stop polling a request that is still running after this long.
+const MAX_TRACK_MS = 15 * 60 * 1000;
 const POLL_MS = 5_000;
+
+function trackingMessage(
+  tracked: Tracked,
+  status: PublishStatus | undefined,
+  age: number
+): string {
+  const progress = progressMessage(tracked, status, age);
+  return tracked.state === 'resumed'
+    ? `This exact post was already sent, so nothing was sent again. ${progress}`
+    : progress;
+}
+
+function progressMessage(
+  tracked: Tracked,
+  status: PublishStatus | undefined,
+  age: number
+): string {
+  if (status?.state === 'done') return 'Finished.';
+  if (status?.state === 'failed') {
+    return `Publishing failed${status.message ? `: ${status.message}` : '.'}`;
+  }
+  if (status?.state === 'not_found' && age > REGISTER_GRACE_MS) {
+    return 'Upload-Post has no record of this post yet. It may still appear — check again in a few minutes before publishing again.';
+  }
+  if (status?.state === 'running' && age > MAX_TRACK_MS) {
+    return 'Still processing at Upload-Post. See app.upload-post.com for the result.';
+  }
+  if (tracked.state === 'unconfirmed') {
+    return 'Upload-Post did not confirm the request. Checking whether it arrived…';
+  }
+  return 'Publishing…';
+}
 
 function PublishTracking({
   teamId,
-  outcome,
-  startedAt,
+  tracked,
   onClose,
+  onNewPost,
 }: {
   teamId: string;
-  outcome: PublishOutcome;
-  startedAt: number;
+  tracked: Tracked;
   onClose: () => void;
+  onNewPost: () => void;
 }) {
+  const { requestId, startedAt } = tracked;
   const {
     data: status,
+    error,
     refetch,
     isFetching,
+    dataUpdatedAt,
   } = useQuery({
-    queryKey: ['social-publish-status', outcome.requestId],
-    queryFn: () =>
-      getSocialPublishStatusFn({
-        data: { teamId, requestId: outcome.requestId },
-      }),
+    queryKey: ['social-publish-status', requestId],
+    queryFn: () => getSocialPublishStatusFn({ data: { teamId, requestId } }),
     refetchInterval: (query) => {
+      if (query.state.status === 'error') return false;
       const state = query.state.data?.state;
-      if (state === 'done') return false;
-      if (state === 'not_found' && Date.now() - startedAt > REGISTER_GRACE_MS) {
-        return false;
-      }
+      if (state === 'done' || state === 'failed') return false;
+      const age = query.state.dataUpdatedAt - startedAt;
+      if (state === 'not_found' && age > REGISTER_GRACE_MS) return false;
+      if (age > MAX_TRACK_MS) return false;
       return POLL_MS;
     },
   });
-
-  // Flips once the grace window has passed; rendering never reads the clock.
-  const [graceOver, setGraceOver] = useState(false);
-  useEffect(() => {
-    const remaining = startedAt + REGISTER_GRACE_MS - Date.now();
-    const id = window.setTimeout(
-      () => setGraceOver(true),
-      Math.max(0, remaining)
-    );
-    return () => window.clearTimeout(id);
-  }, [startedAt]);
-  const notConfirmed = status?.state === 'not_found' && graceOver;
+  // Age at the last poll: render stays pure, and the poll that crosses a
+  // threshold is the one that re-renders with it.
+  const age = dataUpdatedAt - startedAt;
+  const finished = status?.state === 'done' || status?.state === 'failed';
+  // Polling has stopped short of an outcome: offer a manual check.
+  const stopped =
+    !finished &&
+    (Boolean(error) ||
+      (status?.state === 'not_found' && age > REGISTER_GRACE_MS) ||
+      age > MAX_TRACK_MS);
 
   return (
     <div className="flex flex-col gap-4">
       <p aria-live="polite" className="text-sm">
-        {outcome.state === 'resumed'
-          ? 'This exact post was already sent — showing its progress. Nothing was sent again.'
-          : status?.state === 'done'
-            ? 'Finished.'
-            : notConfirmed
-              ? 'Upload-Post has no record of this post yet. It may still appear — check again in a few minutes before publishing again.'
-              : outcome.state === 'unconfirmed'
-                ? 'Upload-Post did not confirm the request. Checking whether it arrived…'
-                : 'Publishing…'}
+        {trackingMessage(tracked, status, age)}
       </p>
+      {error && (
+        <p role="alert" className="text-sm text-destructive">
+          Couldn't check progress: {error.message}
+        </p>
+      )}
       {status && status.results.length > 0 && (
         <ul className="flex flex-col gap-2 text-sm">
           {status.results.map((result) => (
             <li key={result.platform} className="flex flex-col gap-0.5">
               <span className="font-medium">
                 {socialPlatformLabel(result.platform)} —{' '}
-                {result.state === 'published'
-                  ? 'published'
-                  : result.state === 'skipped'
-                    ? 'skipped'
-                    : result.state === 'failed'
-                      ? 'failed'
-                      : 'in progress'}
+                {result.state === 'pending' ? 'in progress' : result.state}
               </span>
               {result.url && (
                 <a
@@ -511,7 +636,12 @@ function PublishTracking({
         <p className="text-sm text-muted-foreground">{status.message}</p>
       )}
       <DialogFooter>
-        {notConfirmed && (
+        {finished && (
+          <Button type="button" variant="outline" onClick={onNewPost}>
+            New post
+          </Button>
+        )}
+        {stopped && (
           <Button
             type="button"
             variant="outline"
